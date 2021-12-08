@@ -3,6 +3,7 @@ import logging
 import sys
 
 import napari
+import numpy as np
 from napari.qt.threading import thread_worker
 
 import flimstream
@@ -25,10 +26,11 @@ def receive(receiver):
             if frame is Ellipsis:
                 logging.info("Worker exiting")
                 return
+            
             if accumulated_frame is None:
-                accumulated_frame = frame
+                accumulated_frame = np.asarray(frame, dtype=np.float32)
             else:
-                accumulated_frame += frame
+                accumulated_frame = accumulated_frame + frame
             yield series_no, seqno, accumulated_frame
 
 
@@ -48,7 +50,7 @@ def run(port):
     worker.quit = lambda: receiver.quit()
     worker.yielded.connect(element_callback)
     worker.start()
-
+    
     logging.info("Starting napari")
     napari.run()
     logging.info("napari exited")

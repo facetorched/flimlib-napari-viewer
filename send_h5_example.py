@@ -13,14 +13,14 @@ def get_h5_dset(filename, key):
     return f[key]
 
 
-def send_series(port, filename, interval):
+def send_series(port, filename, frames, interval):
     f = h5py.File(filename)
     keys= [key for key in f.keys()]
+    keys= keys[:frames]
 
     first = f.get(keys[0])
 
     sender = flimstream.SeriesSender(first.dtype, first.shape, port)
-
     sender.start()
 
     for i, key in enumerate(keys):
@@ -48,11 +48,12 @@ def send_series(port, filename, interval):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     try:
-        _, port, filename, interval = sys.argv
+        _, port, filename, frames, interval = sys.argv
         port = int(port)
+        frames = int(frames)
         interval = float(interval)
     except:
-        print("usage: python send-h5.py port filename interval",
+        print("usage: python send-h5.py port filename frames interval",
                 file=sys.stderr)
         sys.exit(1)
-    send_series(port, filename, interval)
+    send_series(port, filename, frames, interval)

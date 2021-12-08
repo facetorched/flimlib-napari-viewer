@@ -32,8 +32,7 @@ class SeriesViewer():
         self.photon_count = None
         self.phasor = None
         self.phasor_quadtree = None
-        self.intensity = None
-        self.tau = None
+        self.is_compute_thread_running = False
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         self.lifetime_viewer = napari.Viewer(title="Lifetime Viewer")
         #napari.run()
@@ -56,46 +55,38 @@ class SeriesViewer():
         
         self.create_add_selection_widget()
 
-    def update_image_layers(self):
-        self.update_lifetime_image(self.tau, self.intensity)
-        self.update_phasor_image(self.phasor, self.intensity)
+    def update_displays(self, arg):
+        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
+        self.is_compute_thread_running = False
 
-    def update_lifetime_image(self, tau, intensity):
-        intensity *= 1.0/intensity.max()
-        tau *= 1.0/np.nanmax(tau)
-        intensity_scaled_tau = np.zeros([*tau.shape,3], dtype=float)
-
-        # temporary colormap (mark suggested a dict map)
-        for r in range(tau.shape[0]):
-            for c in range(tau.shape[1]):
-                if not np.isnan(tau[r][c]):
-                    intensity_scaled_tau[r][c] = colorsys.hsv_to_rgb(tau[r][c], 1.0, intensity[r][c])
-
-        self.lifetime_image.data = intensity_scaled_tau
-
-    def update_phasor_image(self, phasor, intensity):
-        set_points(self.phasor_image, phasor.reshape(-1,2), intensity=intensity.ravel() * .1)
+        self.phasor = phasor
+        self.phasor_quadtree = phasor_quadtree
+        self.lifetime_image.data = lifetime_image
+        set_points(self.phasor_image, phasor_image, intensity=phasor_intensity)
         self.phasor_image.editable = False
+        self.update_selections()
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
         # check if this is the first time receiving data
         do_setup = self.photon_count is None
-        self.photon_count = np.asarray(photon_count, dtype=np.float32)
+        self.photon_count = photon_count
         if do_setup:
             if self.fit_start is None:
-                self.fit_start = 0
+                self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
             if self.fit_end is None:
                 self.fit_end = self.photon_count.shape[-1]
             autoscale_viewer(self.lifetime_viewer, self.photon_count.shape[0:2])
             self.create_options_widget()
+
         self.update()
 
-    # called after adjusting fit_start/fit_end
     def update(self):
-        self.compute()
-        self.update_image_layers()
-        self.update_selections()
+        if not self.is_compute_thread_running:
+            self.is_compute_thread_running = True
+            worker = compute(self.photon_count, self.period, self.fit_start, self.fit_end)
+            worker.returned.connect(self.update_displays)
+            worker.start()
 
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
@@ -104,20 +95,6 @@ class SeriesViewer():
         for layer in self.phasor_viewer.layers:
             if 'selection' in layer.metadata:
                 layer.metadata['selection'].update_co_selection()
-
-    def compute(self):
-        psr = flimlib.GCI_Phasor(self.period, self.photon_count, fit_start=self.fit_start, fit_end=self.fit_end)
-        #reshape to work well with mapping / creating the image
-        self.phasor = np.round(np.dstack([(psr.v * -1 + 1 ) * PHASOR_SCALE, psr.u * PHASOR_SCALE])).astype(int)
-        self.phasor_quadtree = KDTree(self.phasor.reshape(-1, 2))
-
-        rld = flimlib.GCI_triple_integral_fitting_engine(self.period, self.photon_count, fit_start=self.fit_start, fit_end=self.fit_end)
-        tau = rld.tau
-        tau[tau<0] = np.nan
-        tau[tau>TAU_MAX] = np.nan # TODO how should the contrast limits be handled?
-        tau[rld.chisq > CHISQ_MAX] = np.nan
-        self.tau = tau
-        self.intensity = self.photon_count.sum(axis=-1)
 
     def create_add_selection_widget(self):
         @magicgui(call_button="add lifetime selection")
@@ -145,6 +122,41 @@ class SeriesViewer():
             self.update()
         self.lifetime_viewer.window.add_dock_widget(options_widget, area='left')
         
+def compute_lifetime_image(tau, intensity):
+    intensity *= 1.0/intensity.max()
+    tau *= 1.0/np.nanmax(tau)
+    intensity_scaled_tau = np.zeros([*tau.shape,3], dtype=float)
+
+    # temporary colormap (mark suggested a dict map)
+    for r in range(tau.shape[0]):
+        for c in range(tau.shape[1]):
+            if not np.isnan(tau[r][c]):
+                intensity_scaled_tau[r][c] = colorsys.hsv_to_rgb(tau[r][c], 1.0, intensity[r][c])
+
+    return intensity_scaled_tau
+
+def compute_phasor_image(phasor, intensity):
+    return phasor.reshape(-1,2), intensity.ravel() * .1
+
+@thread_worker
+def compute(photon_count, period, fit_start, fit_end):
+    phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
+    #reshape to work well with mapping / creating the image
+    phasor = np.round(np.dstack([(phasor.v * -1 + 1 ) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
+    phasor_quadtree = KDTree(phasor.reshape(-1, 2))
+
+    rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
+    tau = rld.tau
+    tau[tau<0] = np.nan
+    tau[tau>TAU_MAX] = np.nan # TODO how should the contrast limits be handled?
+    tau[rld.chisq > CHISQ_MAX] = np.nan
+    intensity = photon_count.sum(axis=-1)
+
+    lifetime_image = compute_lifetime_image(tau, intensity)
+    phasor_image, phasor_intensity = compute_phasor_image(phasor, intensity)
+
+    return phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image
+
 def compute_fits(photon_count, period, fit_start, fit_end):
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     param_in = [rld.Z, rld.A, rld.tau]
@@ -272,7 +284,11 @@ def get_bounded_points(layer, image_shape):
         return points
 
 def set_points(points_layer, points, intensity=None):
-    points_layer.data = points if points is None or len(points) else None
+    try:
+        points_layer.data = points if points is None or len(points) else None
+    except OverflowError:
+        # there seems to be a bug in napari with an overflow error
+        pass
     
     if intensity is not None:
         color = np.lib.stride_tricks.as_strided([1.0], shape=(points.shape[0],), strides=(0,))
