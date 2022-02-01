@@ -186,12 +186,11 @@ class CurveFittingPlot():
     
     def update_with_selection(self, selection, period, fit_start, fit_end):
         rld_selected, lm_selected = compute_fits(selection, period, fit_start, fit_end)
-        lm_time = np.linspace(0,(lm_selected.fitted.size-1)*period,lm_selected.fitted.size,dtype=np.float32)
-        rld_time = lm_time[0:rld_selected.fitted.size]
-        self.lm_curve.set_data((lm_time, lm_selected.fitted))
-        self.rld_curve.set_data((rld_time, rld_selected.fitted))
-        self.data_scatter.set_data(np.array((lm_time, selection)).T, size=3, edge_width=0, face_color=self.scatter_color)
-        
+        time = np.linspace(0, lm_selected.fitted.size * period, lm_selected.fitted.size, endpoint=False, dtype=np.float32)
+        fit_time = time[fit_start:fit_end]
+        self.lm_curve.set_data((fit_time, lm_selected.fitted[fit_start:fit_end]))
+        self.rld_curve.set_data((fit_time, rld_selected.fitted[fit_start:fit_end]))
+        self.data_scatter.set_data(np.array((time, selection)).T, size=3, edge_width=0, face_color=self.scatter_color)
         self.rld_info.pos = self.ax.view.size[0], self.rld_info.font_size
         self.rld_info.text = 'RLD | chisq = ' + "{:.2e}".format(float(rld_selected.chisq)) + ', tau = ' + "{:.2e}".format(float(rld_selected.tau))
         self.lm_info.pos = self.ax.view.size[0], self.rld_info.font_size*3

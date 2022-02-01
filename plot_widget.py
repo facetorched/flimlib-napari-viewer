@@ -140,6 +140,8 @@ class PlotWidget(VispyPlotWidget):
                 data = np.array(visual._line._pos).T
             elif hasattr(visual, '_markers'):
                 data = np.array(visual._markers._data['a_position'])[:, :2].T
+            elif isinstance(visual, scene.Markers):
+                data = np.array(visual._data['a_position'])[:, :2].T
             if data is not None and len(data.shape):
                 if axes in ('y', 'both'):
                     y = y if y is not None else [np.inf, -np.inf]
