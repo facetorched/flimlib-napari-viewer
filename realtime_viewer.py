@@ -6,6 +6,7 @@ import time
 import flimlib
 import h5py
 import napari
+from napari.layers.shapes.shapes import Shapes
 import numpy as np
 from plot_widget import Fig
 
@@ -23,6 +24,7 @@ PHASOR_SCALE = 1000
 EMPTY_RGB_IMAGE = np.zeros((1,1,3))
 DEFAULT_POINT = np.zeros((1,2))
 DEFAULT_PHASOR_POINT = np.array([[PHASOR_SCALE//2, PHASOR_SCALE//2]])
+ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 
 class SeriesViewer():
     def __init__(self, period=.04, fit_start=None, fit_end=None):
@@ -142,6 +144,8 @@ def compute_phasor_image(phasor, intensity):
 def compute(photon_count, period, fit_start, fit_end):
     phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     #reshape to work well with mapping / creating the image
+    #TODO why `+ 1` ????
+    #TODO can i have the last dimension be tuple?
     phasor = np.round(np.dstack([(phasor.v * -1 + 1 ) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
     phasor_quadtree = KDTree(phasor.reshape(-1, 2))
 
@@ -238,20 +242,33 @@ class PhasorSelectionMetadata():
         self.series_viewer = series_viewer
 
     def update_co_selection(self):
-        selection_radius = int(self.selection.current_size) - 1 # TODO: Use correct selection radius
-        selection_center = self.selection.data[0]
-
+        extrema = np.ceil(self.selection._extent_data).astype('int') # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
+        bounding_center = np.mean(extrema, axis=0, dtype=int)
+        bounding_shape = extrema[1] - extrema[0]
+        bounding_radius = np.max(bounding_shape) // 2 # distance in the p = inf norm
         height, width, _ = self.series_viewer.phasor.shape
         maxpoints = width * height
-        distances, indices = self.series_viewer.phasor_quadtree.query(selection_center, maxpoints, distance_upper_bound=selection_radius)
+        distances, indices = self.series_viewer.phasor_quadtree.query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
         n_indices = np.searchsorted(distances, np.inf)
         if n_indices > 0:
             indices = indices[0:n_indices]
-            x, y = indices % width, indices // height 
-            set_points(self.co_selection, np.column_stack((y, x)))
-            histograms = self.series_viewer.photon_count[y, x]
-            histogram = np.mean(histograms, axis=0)
-            self.update_decay_plot(histogram)
+            bounded_points = np.asarray([indices // height, indices % width]).T
+
+            points = []
+            offset=extrema[0]
+            # use of private field `_data_view` since the shapes.py `to_masks()` fails to recognize offset
+            # TODO figure out why I need to add to the mask size. only needs this for polygon shape?
+            mask = self.selection._data_view.to_masks(mask_shape=bounding_shape + np.array([20,20]), offset=offset).astype(bool)[0]
+
+            for point in bounded_points:
+                if mask[tuple(self.series_viewer.phasor[tuple(point)] - offset)]:
+                    points += [point]
+            if points:
+                points = np.asarray(points)
+                set_points(self.co_selection, points)
+                points_indexer = tuple(points.T)
+                histogram = np.mean(self.series_viewer.photon_count[points_indexer], axis=0)
+                self.update_decay_plot(histogram)
         else:
             empty_histogram = np.zeros(self.series_viewer.photon_count.shape[-1]) + np.nan
             self.update_decay_plot(empty_histogram)
@@ -262,25 +279,11 @@ class PhasorSelectionMetadata():
     def update_decay_plot(self, selection):
         self.decay_plot.update_with_selection(selection, self.series_viewer.period, self.series_viewer.fit_start, self.series_viewer.fit_end)
 
-def get_points(layer):
-        point_size = int(layer.current_size) - 1 #THIS IS NOT CORRECT (I have no idea what napari considers as point size)
-        points = []      
-        for point in layer.data.astype(int):
-            for r in range(point[0] - point_size, point[0] + point_size + 1):
-                for c in range(point[1] - point_size, point[1] + point_size + 1):
-                    points += [[r, c]]
-        return points
+def get_points(layer: Shapes):
+        return get_bounded_points(layer, None)
 
-def get_bounded_points(layer, image_shape):
-        points = []
-        point_size = int(layer.current_size) - 1 #THIS IS NOT CORRECT (I have no idea what napari considers as point size)
-        for point in layer.data.astype(int):
-            rmax = image_shape[0] - 1
-            cmax = image_shape[1] - 1
-            for r in range(min(rmax, max(0, point[0] - point_size)), min(rmax, max(0, point[0] + point_size + 1))):
-                for c in range(min(cmax, max(0, point[1] - point_size)), min(cmax, max(0, point[1] + point_size + 1))):
-                    points += [[r, c]]
-        return points
+def get_bounded_points(layer: Shapes, image_shape):
+        return np.asarray(np.where(layer.to_masks(image_shape).astype(bool)[0])).T
 
 def set_points(points_layer, points, intensity=None):
     try:
@@ -294,7 +297,7 @@ def set_points(points_layer, points, intensity=None):
         points_layer.face_color = np.array([color,color,color,intensity]).T
     points_layer.selected_data = {}
 
-def select_points_drag(layer, event):
+def select_shape_drag(layer, event):
     try:
         layer.metadata['selection'].update_co_selection()
         yield
@@ -302,45 +305,43 @@ def select_points_drag(layer, event):
             layer.metadata['selection'].update_co_selection()
             yield
     except Exception as e:
-        print("select_points_drag")
+        print("select_shape_drag")
         print(event.type)
         print(e)
 
-def handle_new_point(event):
+def handle_new_shape(event):
     event_layer = event._sources[0]
-    try:
-        # make sure to check if each of these operations has already been done since
-        # changing the data triggers this event which may cause infinite recursion
-        if event_layer.data.shape[0] > 0 and event_layer.data.dtype != int:
-            event_layer.data = np.round(event_layer.data).astype(int)
-        if event_layer.data.shape[0] > 1 and event_layer.editable:
-            event_layer.data = event_layer.data[-1:]
-        if event_layer.data.shape[0] > 0:
-            if('selection' in event_layer.metadata):
-                event_layer.metadata['selection'].update_co_selection()
-    except Exception as e:
-        print("handle_new_point")
-        print(e)
+
+    # make sure to check if each of these operations has already been done since
+    # changing the data triggers this event which may cause infinite recursion
+    #if event_layer.data.shape[0] > 0 and event_layer.data.dtype != int:
+    #    event_layer.data = np.round(event_layer.data).astype(int)
+    if len(event_layer.data) > 1 and event_layer.editable:
+        event_layer.data = event_layer.data[-1:]
+    if len(event_layer.data) > 0:
+        if('selection' in event_layer.metadata):
+            event_layer.metadata['selection'].update_co_selection()
+
 
 def create_lifetime_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'):
-    selection = viewer.add_points(DEFAULT_POINT, name="Selection", symbol="square", face_color=color+"7f", edge_width=0)
+    selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': LifetimeSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
-    selection.mouse_drag_callbacks.append(select_points_drag)
-    selection.events.data.connect(handle_new_point)
+    selection.mouse_drag_callbacks.append(select_shape_drag)
+    selection.events.data.connect(handle_new_shape)
     selection.mode = 'select'
     return selection
 
 def create_phasor_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'):
-    selection = viewer.add_points(DEFAULT_PHASOR_POINT, name="Selection", symbol="square", face_color=color+"7f", edge_width=0)
+    selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': PhasorSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
-    selection.mouse_drag_callbacks.append(select_points_drag)
-    selection.events.data.connect(handle_new_point)
+    selection.mouse_drag_callbacks.append(select_shape_drag)
+    selection.events.data.connect(handle_new_shape)
     selection.mode = 'select'
     return selection
 
