@@ -144,9 +144,8 @@ def compute_phasor_image(phasor, intensity):
 def compute(photon_count, period, fit_start, fit_end):
     phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     #reshape to work well with mapping / creating the image
-    #TODO why `+ 1` ????
-    #TODO can i have the last dimension be tuple?
-    phasor = np.round(np.dstack([(phasor.v * -1 + 1 ) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
+    #TODO can i have the last dimension be tuple? this would simplify indexing later
+    phasor = np.round(np.dstack([(1 - phasor.v) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
     phasor_quadtree = KDTree(phasor.reshape(-1, 2))
 
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
@@ -242,10 +241,15 @@ class PhasorSelectionMetadata():
         self.series_viewer = series_viewer
 
     def update_co_selection(self):
-        extrema = np.ceil(self.selection._extent_data).astype('int') # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
-        bounding_center = np.mean(extrema, axis=0, dtype=int)
-        bounding_shape = extrema[1] - extrema[0]
-        bounding_radius = np.max(bounding_shape) // 2 # distance in the p = inf norm
+        if len(self.selection.data) == 0:
+            empty_histogram = np.zeros(self.series_viewer.photon_count.shape[-1]) + np.nan
+            self.update_decay_plot(empty_histogram)
+            set_points(self.co_selection, None)
+            return
+        extrema = np.ceil(self.selection._extent_data).astype(int) # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
+        bounding_center = np.mean(extrema, axis=0)
+        bounding_shape = extrema[1] - extrema[0] + np.ones(2, dtype=int) # add one since extremas are inclusive. does this make sense?
+        bounding_radius = np.max(bounding_center - extrema[0]) # distance in the p = inf norm
         height, width, _ = self.series_viewer.phasor.shape
         maxpoints = width * height
         distances, indices = self.series_viewer.phasor_quadtree.query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
@@ -257,14 +261,20 @@ class PhasorSelectionMetadata():
             points = []
             offset=extrema[0]
             # use of private field `_data_view` since the shapes.py `to_masks()` fails to recognize offset
-            # TODO figure out why I need to add to the mask size. only needs this for polygon shape?
-            mask = self.selection._data_view.to_masks(mask_shape=bounding_shape + np.array([20,20]), offset=offset).astype(bool)[0]
+            mask = self.selection._data_view.to_masks(mask_shape=bounding_shape, offset=offset).astype(bool)[0]
 
             for point in bounded_points:
-                if mask[tuple(self.series_viewer.phasor[tuple(point)] - offset)]:
+                bounded_phasor = self.series_viewer.phasor[tuple(point)]
+                mask_indexer = tuple(bounded_phasor - offset)
+                # kd tree found a square bounding box. some of these points might be outside of the rectangular mask
+                if mask_indexer[0] < 0 or mask_indexer[1] < 0 or mask_indexer[0] >= bounding_shape[0] or mask_indexer[1] >= bounding_shape[1]:
+                    continue
+                if mask[mask_indexer]:
                     points += [point]
             if points:
                 points = np.asarray(points)
+                if np.any(points < 0):
+                    raise ValueError("Negative index encountered while indexing image layer. This is outside the image!")
                 set_points(self.co_selection, points)
                 points_indexer = tuple(points.T)
                 histogram = np.mean(self.series_viewer.photon_count[points_indexer], axis=0)
@@ -298,16 +308,11 @@ def set_points(points_layer, points, intensity=None):
     points_layer.selected_data = {}
 
 def select_shape_drag(layer, event):
-    try:
+    layer.metadata['selection'].update_co_selection()
+    yield
+    while event.type == 'mouse_move':
         layer.metadata['selection'].update_co_selection()
         yield
-        while event.type == 'mouse_move':
-            layer.metadata['selection'].update_co_selection()
-            yield
-    except Exception as e:
-        print("select_shape_drag")
-        print(event.type)
-        print(e)
 
 def handle_new_shape(event):
     event_layer = event._sources[0]
