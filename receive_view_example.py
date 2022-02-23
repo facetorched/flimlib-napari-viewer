@@ -12,7 +12,6 @@ from realtime_viewer import SeriesViewer
 @thread_worker
 def receive(receiver):
     series_no = -1
-    accumulated_frame = None
     while True:
         series_receiver = receiver.wait_and_receive_series()
         if not series_receiver or series_receiver is Ellipsis:
@@ -27,11 +26,7 @@ def receive(receiver):
                 logging.info("Worker exiting")
                 return
             
-            if accumulated_frame is None:
-                accumulated_frame = np.asarray(frame, dtype=np.float32)
-            else:
-                accumulated_frame = accumulated_frame + frame
-            yield series_no, seqno, accumulated_frame
+            yield series_no, seqno, frame
 
 
 def run(port):

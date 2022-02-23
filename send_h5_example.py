@@ -18,18 +18,19 @@ def send_series(port, filename, frames, interval):
     keys= [key for key in f.keys()]
     keys= keys[:frames]
 
-    first = f.get(keys[0])
+    frame = np.asarray(f.get(keys[0]), dtype=np.uint16)
 
-    sender = flimstream.SeriesSender(first.dtype, first.shape, port)
+    sender = flimstream.SeriesSender(frame.dtype, frame.shape, port)
     sender.start()
 
     for i, key in enumerate(keys):
         start = time.time()
 
-        sender.send_element(i, f.get(key))
+        if(i != 0):
+            frame += f.get(key)
+        sender.send_element(i, frame)
 
         finish = time.time()
-
         excess = finish - start - interval
         if excess > 0:
             logging.warning(f"Frame interval exceeded by {excess} s")
