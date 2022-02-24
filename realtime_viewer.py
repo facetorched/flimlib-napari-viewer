@@ -16,8 +16,6 @@ from scipy.spatial import KDTree
 from vispy.scene.visuals import Text
 
 FONT_SIZE = 10
-TAU_MAX = 4
-CHISQ_MAX = 200
 PHASOR_SCALE = 1000
 PHASOR_OPACITY_FACTOR = 0.2
 
@@ -27,6 +25,7 @@ DEFAULT_POINT = np.zeros((1,2))
 DEFAULT_PHASOR_POINT = np.array([[PHASOR_SCALE//2, PHASOR_SCALE//2]])
 ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 DEFUALT_MIN_INTENSITY = 10
+DEFUALT_MAX_CHISQ = 200
 
 class SeriesViewer():
     def __init__(self, period=.04, fit_start=None, fit_end=None):
@@ -34,6 +33,8 @@ class SeriesViewer():
         self.fit_start=fit_start
         self.fit_end=fit_end
         self.min_intensity=DEFUALT_MIN_INTENSITY
+        self.max_chisq=DEFUALT_MAX_CHISQ
+        self.max_tau=np.inf
         self.photon_count = None
         self.phasor = None
         self.phasor_quadtree = None
@@ -81,6 +82,7 @@ class SeriesViewer():
                 self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
             if self.fit_end is None:
                 self.fit_end = self.photon_count.shape[-1]
+            self.max_tau = self.photon_count.shape[-1] * self.period # default is the width of the histogram
             autoscale_viewer(self.lifetime_viewer, self.photon_count.shape[0:2])
             self.create_options_widget()
 
@@ -89,7 +91,8 @@ class SeriesViewer():
     def update(self):
         if not self.is_compute_thread_running:
             self.is_compute_thread_running = True
-            worker = compute(self.photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity)
+            # make sure that the contents of the passed objects are not modified in main thread
+            worker = compute(self.photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
 
@@ -115,18 +118,27 @@ class SeriesViewer():
 
     def create_options_widget(self):
         @magicgui(auto_call=True, 
+            pd={"label" : "Period (ns)"},
             start={"label": "Fit Start= {:.2f}ns".format(self.fit_start * self.period), "max": self.photon_count.shape[-1]}, 
             end={"label": "Fit End= {:.2f}ns".format(self.fit_end * self.period), "max": self.photon_count.shape[-1]},
-            intensity={"label": "Min Intensity"},
+            mini={"label": "Min Intensity"},
+            maxc={"label": "Max χ2"},
+            maxt={"label": "Max Lifetime"},
             )
         def options_widget(
+            pd : float = self.period,
             start : int = self.fit_start,
             end : int = self.fit_end,
-            intensity : int = DEFUALT_MIN_INTENSITY,
+            mini : int = self.min_intensity,
+            maxc : int = self.max_chisq,
+            maxt : float = self.max_tau
         ):
+            self.period = pd
             self.fit_start = start
             self.fit_end = end
-            self.min_intensity = intensity
+            self.min_intensity = mini
+            self.max_chisq = maxc
+            self.max_tau = maxt
             self.update()
         self.lifetime_viewer.window.add_dock_widget(options_widget, area='left')
         
@@ -154,10 +166,9 @@ def compute_phasor_image(phasor, intensity):
     return phasor.reshape(-1,2), intensity.ravel() * PHASOR_OPACITY_FACTOR
 
 @thread_worker
-def compute(photon_count, period, fit_start, fit_end, min_intensity):
+def compute(photon_count, period, fit_start, fit_end, min_intensity, max_chisq, max_tau):
     photon_count = np.asarray(photon_count, dtype=np.float32)
     intensity = photon_count.sum(axis=-1)
-    print(np.mean(intensity))
     phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     #reshape to work well with mapping / creating the image
     #TODO can i have the last dimension be tuple? this would simplify indexing later
@@ -166,21 +177,12 @@ def compute(photon_count, period, fit_start, fit_end, min_intensity):
 
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     tau = rld.tau
-    tau[tau<0] = np.nan
-    
+
     tau[intensity < min_intensity] = np.nan
-    #intensity_mean = np.nanmean(intensity)
-    #intensity_std = np.std(intensity)
-
-    #tau[intensity < intensity_mean - intensity_std] = np.nan
-
-    #median_chisq = np.nanmedian(rld.chisq)
-    #tau[np.isnan(rld.chisq)] = np.nan
-    #tau[rld.chisq > median_chisq * 2] = np.nan # chisq seems to be going down???
-
-    # a longer lifetime than the fit range is probably not valid
-    tau[tau>(fit_end-fit_start) * period] = np.nan # TODO how should the contrast limits be handled?
-    
+    tau[rld.chisq > max_chisq] = np.nan
+    # negative lifetimes are not valid
+    tau[tau<0] = np.nan 
+    tau[tau > max_tau] = np.nan
 
     lifetime_image = compute_lifetime_image(tau, intensity)
     phasor_image, phasor_intensity = compute_phasor_image(phasor, intensity)
