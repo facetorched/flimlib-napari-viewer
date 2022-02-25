@@ -145,15 +145,16 @@ class PlotWidget(VispyPlotWidget):
             if data is not None and len(data.shape):
                 if axes in ('y', 'both'):
                     y = y if y is not None else [np.inf, -np.inf]
-                    y[1] = np.maximum(data[1].max(), y[1])
-                    y[0] = np.minimum(data[1].min(), y[0])
+                    y[1] = np.nanmax((np.nanmax(data[1]), y[1]))
+                    y[0] = np.nanmin((np.nanmin(data[1]), y[0]))
                 if axes in ('x', 'both'):
                     x = x if x is not None else [np.inf, -np.inf]
-                    x[1] = np.maximum(data[0].max(), x[1])
-                    x[0] = np.minimum(data[0].min(), x[0])
+                    x[1] = np.nanmax((np.nanmax(data[0]), x[1]))
+                    x[0] = np.nanmin((np.nanmin(data[0]), x[0]))
         x = None if np.any(np.isnan(x)) else x
         y = None if np.any(np.isnan(y)) else y
         self.view.camera.set_range(x, y, margin=0.005)
+        return x,y
 
     def _configure_2d(self, fg_color=None):
         if self._configured:
