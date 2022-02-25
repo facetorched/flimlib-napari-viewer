@@ -27,21 +27,32 @@ ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 DEFUALT_MIN_INTENSITY = 10
 DEFUALT_MAX_CHISQ = 200
 
+# TODO create a class for image layers
+
 class SeriesViewer():
     def __init__(self, period=.04, fit_start=None, fit_end=None):
+        # series viewer parameters
         self.period = period
         self.fit_start=fit_start
         self.fit_end=fit_end
         self.min_intensity=DEFUALT_MIN_INTENSITY
         self.max_chisq=DEFUALT_MAX_CHISQ
         self.max_tau=np.inf
+        self.is_compute_thread_running = False
+
+        # TODO the following should be stored inside a dataclass frozen=True, (we make a new dataclass each time receive new data)
         self.photon_count = None
         self.phasor = None
         self.phasor_quadtree = None
-        self.is_compute_thread_running = False
+
+        # objects within series viewer
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         self.lifetime_viewer = napari.Viewer(title="Lifetime Viewer")
-        #napari.run()
+
+        # TODO create an image class. Holds on to the napari layer as well as the dataclass and the list of image layers. This class can be used by the selections
+        # TODO store a live image.
+        # TODO also store snapshotted images. within a list that also has live image
+        # TODO create a way of identifying the topmost visible image layer. loop over all layers and == with image list. while accessing, if encounter a deleted layer, remove it from the list (in place)
         self.phasor_image = self.phasor_viewer.add_points(None, name="Phasor", edge_width=0, size = 3)
         self.phasor_image.editable = False
         self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
@@ -62,8 +73,10 @@ class SeriesViewer():
         self.create_add_selection_widget()
 
     def update_displays(self, arg):
-        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
+        # this function is where compute thread returns to display thread
         self.is_compute_thread_running = False
+
+        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
 
         self.phasor = phasor
         self.phasor_quadtree = phasor_quadtree
@@ -91,11 +104,12 @@ class SeriesViewer():
     def update(self):
         if not self.is_compute_thread_running:
             self.is_compute_thread_running = True
-            # make sure that the contents of the passed objects are not modified in main thread
+            # Note: the contents of the passed objects are not modified in main thread
             worker = compute(self.photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
 
+    # TODO selections should identify the uppermost, visible layer and use the data from there
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
             if 'selection' in layer.metadata:
