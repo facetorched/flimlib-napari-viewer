@@ -10,6 +10,7 @@ from napari.layers.shapes.shapes import Shapes
 import numpy as np
 from plot_widget import Fig
 
+from dataclasses import dataclass
 from magicgui import magicgui
 from napari.qt.threading import thread_worker
 from scipy.spatial import KDTree
@@ -27,7 +28,67 @@ ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 DEFUALT_MIN_INTENSITY = 10
 DEFUALT_MAX_CHISQ = 200
 
+class ListArray:
+    """An array-like object backed by a list of ndarrays."""
+
+    def __init__(self, arrays):
+        if not len(arrays):
+            raise ValueError # At least for now, don't allow empty
+
+        self._arrays = []
+        self._dtype = None
+        self._shape = None
+        for a in arrays:
+            self._arrays.append(np.asarray(a))
+            if self._dtype is None:
+                self._dtype = self._arrays[0].dtype
+            elif self._arrays[-1].dtype != self._dtype:
+                raise ValueError
+            if self._shape is None:
+                self._shape = self._arrays[0].shape
+            elif self._arrays[-1].shape != self._shape:
+                raise ValueError
+
+    @property
+    def ndim(self):
+        return 1 + len(self._shape)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def shape(self):
+        return (len(self._arrays),) + self._shape
+
+    def __getitem__(self, slices):
+        if not isinstance(slices, tuple):
+            slices = (slices,)
+        ndslices = slices[1:]
+        s0 = slices[0]
+        if isinstance(s0, slice):
+            start, stop, step = s0.indices(len(self._arrays))
+            dim0 = (stop - start) // step
+            shape = (dim0,) + self._shape
+            ret = np.empty_like(self._arrays[0], shape=shape)
+            j0 = 0
+            for i0 in range(start, stop, step):
+                ret[j0] = self._arrays[i0][ndslices]
+                j0 += 1
+            return ret
+        else:  # s0 is an integer
+            return self._arrays[s0][ndslices]
+
+    def __array__(self):
+        return self[:]
+
 # TODO create a class for image layers
+
+@dataclass
+class SnapshotData:
+    photon_count : np.ndarray
+    phasor : np.ndarray
+    phasor_quadtree : KDTree
 
 class SeriesViewer():
     def __init__(self, period=.04, fit_start=None, fit_end=None):
@@ -39,31 +100,37 @@ class SeriesViewer():
         self.max_chisq=DEFUALT_MAX_CHISQ
         self.max_tau=np.inf
         self.is_compute_thread_running = False
+        self.is_cumulative = False
 
-        # TODO the following should be stored inside a dataclass frozen=True, (we make a new dataclass each time receive new data)
-        self.photon_count = None
-        self.phasor = None
-        self.phasor_quadtree = None
-
-        # objects within series viewer
-        self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
+        # objects within series viewer (only one of each of these)
         self.lifetime_viewer = napari.Viewer(title="Lifetime Viewer")
-
-        # TODO create an image class. Holds on to the napari layer as well as the dataclass and the list of image layers. This class can be used by the selections
-        # TODO store a live image.
-        # TODO also store snapshotted images. within a list that also has live image
-        # TODO create a way of identifying the topmost visible image layer. loop over all layers and == with image list. while accessing, if encounter a deleted layer, remove it from the list (in place)
-        self.phasor_image = self.phasor_viewer.add_points(None, name="Phasor", edge_width=0, size = 3)
-        self.phasor_image.editable = False
-        self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
-        
+        self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         autoscale_viewer(self.phasor_viewer, (PHASOR_SCALE, PHASOR_SCALE))
+
+        # TODO must force phasor and lifetime plots to be synchronized in which time they are currently viewing
+        self.snapshots = []
+        
+        self.phasor_image_data = [None,]
+        self.phasor_image = None
+        self.lifetime_image_data = [None,]
+        self.lifetime_image = None
+        
+        @self.lifetime_viewer.dims.events.current_step.connect
+        def lifetime_slider_changed(event):
+            self.phasor_viewer.dims.current_step = self.lifetime_viewer.current_step
+            self.update()
+
+        @self.phasor_viewer.dims.events.current_step.connect
+        def phasor_slider_changed(event):
+            self.lifetime_viewer.dims.current_step = self.phasor_viewer.current_step
+            self.update()
+
         #add the phasor circle
         phasor_circle = np.asarray([[PHASOR_SCALE, 0.5 * PHASOR_SCALE],[0.5 * PHASOR_SCALE,0.5 * PHASOR_SCALE]])
         x_axis_line = np.asarray([[PHASOR_SCALE,0],[PHASOR_SCALE,PHASOR_SCALE]])
         phasor_shapes_layer = self.phasor_viewer.add_shapes([phasor_circle, x_axis_line], shape_type=['ellipse','line'], face_color='',)
         phasor_shapes_layer.editable = False
-
+        
         self.colors = color_gen()
 
         #set up select layers
@@ -72,42 +139,60 @@ class SeriesViewer():
         
         self.create_add_selection_widget()
 
-    def update_displays(self, arg):
-        # this function is where compute thread returns to display thread
-        self.is_compute_thread_running = False
+    def current_step(self):
+        return self.lifetime_viewer.dims.current_step[0]
 
-        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
-
-        self.phasor = phasor
-        self.phasor_quadtree = phasor_quadtree
-        self.lifetime_image.data = lifetime_image
-        set_points(self.phasor_image, phasor_image, intensity=phasor_intensity)
+    def setup(self):
+        """
+        setup occurs after the first frame has arrived. 
+        At this point we know what shape the incoming data is
+        """
+        photon_count = self.snapshots[0].photon_count
+        if self.fit_start is None:
+            self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
+        if self.fit_end is None:
+            self.fit_end = photon_count.shape[-1]
+        self.max_tau = photon_count.shape[-1] * self.period # default is the width of the histogram
+        self.phasor_image = self.phasor_viewer.add_points(None, name="Phasor", edge_width=0, size = 3)
         self.phasor_image.editable = False
-        self.update_selections()
+        self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
+        autoscale_viewer(self.lifetime_viewer, photon_count.shape[0:2])
+        self.create_options_widget()
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
         # check if this is the first time receiving data
-        do_setup = self.photon_count is None
-        self.photon_count = photon_count
-        if do_setup:
-            if self.fit_start is None:
-                self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
-            if self.fit_end is None:
-                self.fit_end = self.photon_count.shape[-1]
-            self.max_tau = self.photon_count.shape[-1] * self.period # default is the width of the histogram
-            autoscale_viewer(self.lifetime_viewer, self.photon_count.shape[0:2])
-            self.create_options_widget()
-
+        if not self.snapshots:
+            self.snapshots += [SnapshotData(photon_count=photon_count)]
+            self.setup()
+        else:
+            self.snapshots[-1].photon_count = photon_count
         self.update()
 
     def update(self):
         if not self.is_compute_thread_running:
             self.is_compute_thread_running = True
             # Note: the contents of the passed objects are not modified in main thread
-            worker = compute(self.photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity, self.max_chisq, self.max_tau)
+            photon_count = self.snapshots[self.current_step()].photon_count
+            worker = compute(photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
+
+    def update_displays(self, arg):
+        # this function is where compute thread returns to display thread
+        self.is_compute_thread_running = False
+        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
+        step = self.current_step()
+        self.snapshots[step].phasor = phasor
+        self.snapshots[step].phasor_quadtree = phasor_quadtree
+
+        self.lifetime_image_data[step] = lifetime_image
+        self.phasor_image_data[step] = phasor_image
+
+        self.lifetime_image.data = ListArray(self.lifetime_image_data)
+        set_points(self.phasor_image, phasor_image, intensity=phasor_intensity)
+        self.phasor_image.editable = False
+        self.update_selections()
 
     # TODO selections should identify the uppermost, visible layer and use the data from there
     def update_selections(self):
