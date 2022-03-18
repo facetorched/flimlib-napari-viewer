@@ -149,7 +149,7 @@ class SeriesViewer():
         """
         photon_count = self.snapshots[0].photon_count
         if self.fit_start is None:
-            self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
+            self.fit_start = int(np.argmax(photon_count.reshape(-1, photon_count.shape[-1]).sum(axis=0))) #estimate fit start
         if self.fit_end is None:
             self.fit_end = photon_count.shape[-1]
         self.max_tau = photon_count.shape[-1] * self.period # default is the width of the histogram
@@ -161,6 +161,8 @@ class SeriesViewer():
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
+        # for now, we ignore all but the first channel
+        photon_count = photon_count[tuple([0] * (photon_count.ndim - 3))]
         # check if this is the first time receiving data
         if not self.snapshots:
             self.snapshots += [SnapshotData(photon_count=photon_count)]
