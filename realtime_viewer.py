@@ -87,18 +87,19 @@ class SeriesViewer():
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
+        # for now, we ignore all but the first channel
+        photon_count = photon_count[tuple([0] * (photon_count.ndim - 3))]
         # check if this is the first time receiving data
         do_setup = self.photon_count is None
         self.photon_count = photon_count
         if do_setup:
             if self.fit_start is None:
-                self.fit_start = int(np.argmax(np.sum(photon_count, axis=(0,1)))) #estimate fit start
+                self.fit_start = int(np.argmax(photon_count.reshape(-1, photon_count.shape[-1]).sum(axis=0))) #estimate fit start
             if self.fit_end is None:
                 self.fit_end = self.photon_count.shape[-1]
             self.max_tau = self.photon_count.shape[-1] * self.period # default is the width of the histogram
             autoscale_viewer(self.lifetime_viewer, self.photon_count.shape[0:2])
             self.create_options_widget()
-
         self.update()
 
     def update(self):
