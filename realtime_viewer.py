@@ -7,6 +7,7 @@ import flimlib
 import h5py
 import napari
 from napari.layers.shapes.shapes import Shapes
+from napari.layers.points.points import Points
 import numpy as np
 from plot_widget import Fig
 
@@ -22,6 +23,7 @@ PHASOR_OPACITY_FACTOR = 0.2
 
 # not actually empty. Ideally I could use None as input to napari but it doesn't like it
 EMPTY_RGB_IMAGE = np.zeros((1,1,3))
+EMPTY_PHASOR_IMAGE = np.zeros((1,3))
 DEFAULT_POINT = np.zeros((1,2))
 DEFAULT_PHASOR_POINT = np.array([[PHASOR_SCALE//2, PHASOR_SCALE//2]])
 ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
@@ -81,6 +83,9 @@ class ListArray:
 
     def __array__(self):
         return self[:]
+    
+    def __len__(self):
+        return np.prod(self.shape)
 
 # TODO create a class for image layers
 
@@ -91,6 +96,7 @@ class SnapshotData:
     phasor_quadtree : KDTree
 
 class SeriesViewer():
+
     def __init__(self, period=.04, fit_start=None, fit_end=None):
         # series viewer parameters
         self.period = period
@@ -115,14 +121,15 @@ class SeriesViewer():
         self.lifetime_image_data = [None,]
         self.lifetime_image = None
         
+        # TODO does the following create a feedback loop?
         @self.lifetime_viewer.dims.events.current_step.connect
         def lifetime_slider_changed(event):
-            self.phasor_viewer.dims.current_step = self.lifetime_viewer.current_step
+            self.phasor_viewer.dims.current_step = self.lifetime_viewer.dims.current_step
             self.update()
 
         @self.phasor_viewer.dims.events.current_step.connect
         def phasor_slider_changed(event):
-            self.lifetime_viewer.dims.current_step = self.phasor_viewer.current_step
+            self.lifetime_viewer.dims.current_step = self.phasor_viewer.dims.current_step
             self.update()
 
         #add the phasor circle
@@ -139,25 +146,34 @@ class SeriesViewer():
         
         self.create_add_selection_widget()
 
-    def current_step(self):
+    def get_current_step(self):
         return self.lifetime_viewer.dims.current_step[0]
+    
+    def get_tau_axis_size(self):
+        return self.snapshots[0].photon_count.shape[-1]
+
+    def get_image_shape(self):
+        """returns shape of the image (height, width)"""
+        return self.snapshots[0].photon_count.shape[-3:-1]
 
     def setup(self):
         """
         setup occurs after the first frame has arrived. 
         At this point we know what shape the incoming data is
         """
-        photon_count = self.snapshots[0].photon_count
+        first = self.snapshots[0].photon_count
+        tau_axis_size = self.get_tau_axis_size()
         if self.fit_start is None:
-            self.fit_start = int(np.argmax(photon_count.reshape(-1, photon_count.shape[-1]).sum(axis=0))) #estimate fit start
+            self.fit_start = int(np.argmax(first.reshape(-1, tau_axis_size).sum(axis=0))) #estimate fit start
         if self.fit_end is None:
-            self.fit_end = photon_count.shape[-1]
-        self.max_tau = photon_count.shape[-1] * self.period # default is the width of the histogram
-        self.phasor_image = self.phasor_viewer.add_points(None, name="Phasor", edge_width=0, size = 3)
+            self.fit_end = tau_axis_size
+        self.max_tau = tau_axis_size * self.period # default is the width of the histogram
+        self.phasor_image = self.phasor_viewer.add_points(EMPTY_PHASOR_IMAGE, name="Phasor", edge_width=0, size=3)
         self.phasor_image.editable = False
         self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
-        autoscale_viewer(self.lifetime_viewer, photon_count.shape[0:2])
+        autoscale_viewer(self.lifetime_viewer, self.get_image_shape())
         self.create_options_widget()
+        self.create_snap_widget()
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
@@ -165,26 +181,26 @@ class SeriesViewer():
         photon_count = photon_count[tuple([0] * (photon_count.ndim - 3))]
         # check if this is the first time receiving data
         if not self.snapshots:
-            self.snapshots += [SnapshotData(photon_count=photon_count)]
+            self.snapshots += [SnapshotData(photon_count,None,None)]
             self.setup()
         else:
-            self.snapshots[-1].photon_count = photon_count
+            self.snapshots[-1].photon_count = photon_count # live frame is the last
         self.update()
 
     def update(self):
         if not self.is_compute_thread_running:
             self.is_compute_thread_running = True
             # Note: the contents of the passed objects are not modified in main thread
-            photon_count = self.snapshots[self.current_step()].photon_count
-            worker = compute(photon_count, self.period, self.fit_start, self.fit_end, self.min_intensity, self.max_chisq, self.max_tau)
+            step = self.get_current_step()
+            photon_count = self.snapshots[step].photon_count
+            worker = compute(photon_count, self.period, self.fit_start, self.fit_end, step, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
 
     def update_displays(self, arg):
         # this function is where compute thread returns to display thread
         self.is_compute_thread_running = False
-        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image = arg
-        step = self.current_step()
+        phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image, step = arg
         self.snapshots[step].phasor = phasor
         self.snapshots[step].phasor_quadtree = phasor_quadtree
 
@@ -192,11 +208,16 @@ class SeriesViewer():
         self.phasor_image_data[step] = phasor_image
 
         self.lifetime_image.data = ListArray(self.lifetime_image_data)
-        set_points(self.phasor_image, phasor_image, intensity=phasor_intensity)
+        # TODO make this memory efficient
+        #set_points(self.phasor_image, ListArray(self.phasor_image_data), intensity=phasor_intensity)
+        print(np.max(np.array(self.phasor_image_data).reshape(-1, 3)[:,0]))
+        print(np.array(self.phasor_image_data).reshape(-1, 3).shape)
+        #self.phasor_image.data = np.array(self.phasor_image_data).reshape(-1, 3)
+        set_points(self.phasor_image, np.array(self.phasor_image_data).reshape(-1, 3), intensity=phasor_intensity)
         self.phasor_image.editable = False
         self.update_selections()
 
-    # TODO selections should identify the uppermost, visible layer and use the data from there
+    # TODO selections should only select the current viewed step
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
             if 'selection' in layer.metadata:
@@ -217,11 +238,21 @@ class SeriesViewer():
         self.lifetime_viewer.window.add_dock_widget(add_lifetime_selection, area='left')
         self.phasor_viewer.window.add_dock_widget(add_phasor_selection, area='left')
 
+    def create_snap_widget(self):
+        @magicgui(call_button="snap")
+        def snap():
+            prev = self.snapshots[-1]
+            self.snapshots += [SnapshotData(prev.photon_count, prev.phasor, prev.phasor_quadtree)]
+            self.lifetime_image_data += [self.lifetime_image_data[-1]]
+            self.phasor_image_data += [self.phasor_image_data[-1]]
+        self.lifetime_viewer.window.add_dock_widget(snap, area='left')
+
     def create_options_widget(self):
+        tau_axis_size = self.get_tau_axis_size()
         @magicgui(auto_call=True, 
             pd={"label" : "Period (ns)"},
-            start={"label": "Fit Start= {:.2f}ns".format(self.fit_start * self.period), "max": self.photon_count.shape[-1]}, 
-            end={"label": "Fit End= {:.2f}ns".format(self.fit_end * self.period), "max": self.photon_count.shape[-1]},
+            start={"label": "Fit Start= {:.2f}ns".format(self.fit_start * self.period), "min": 0, "max": tau_axis_size - 1}, 
+            end={"label": "Fit End= {:.2f}ns".format(self.fit_end * self.period),"min": 1, "max": tau_axis_size},
             mini={"label": "Min Intensity"},
             maxc={"label": "Max χ2"},
             maxt={"label": "Max Lifetime"},
@@ -264,17 +295,17 @@ def compute_lifetime_image(tau, intensity):
     return intensity_scaled_tau
 
 def compute_phasor_image(phasor, intensity):
-    return phasor.reshape(-1,2), intensity.ravel() * PHASOR_OPACITY_FACTOR
+    return phasor.reshape(-1,phasor.shape[-1]), intensity.ravel() * PHASOR_OPACITY_FACTOR
 
 @thread_worker
-def compute(photon_count, period, fit_start, fit_end, min_intensity, max_chisq, max_tau):
+def compute(photon_count, period, fit_start, fit_end, step, min_intensity, max_chisq, max_tau):
     photon_count = np.asarray(photon_count, dtype=np.float32)
     intensity = photon_count.sum(axis=-1)
     phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     #reshape to work well with mapping / creating the image
     #TODO can i have the last dimension be tuple? this would simplify indexing later
-    phasor = np.round(np.dstack([(1 - phasor.v) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
-    phasor_quadtree = KDTree(phasor.reshape(-1, 2))
+    phasor = np.round(np.dstack([np.full_like(phasor.v, step), (1 - phasor.v) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
+    phasor_quadtree = KDTree(phasor.reshape(-1, phasor.shape[-1])[:,1:])
 
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     tau = rld.tau
@@ -288,7 +319,7 @@ def compute(photon_count, period, fit_start, fit_end, min_intensity, max_chisq, 
     lifetime_image = compute_lifetime_image(tau, intensity)
     phasor_image, phasor_intensity = compute_phasor_image(phasor, intensity)
 
-    return phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image
+    return phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image, step
 
 def compute_fits(photon_count, period, fit_start, fit_end):
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
@@ -339,22 +370,23 @@ class CurveFittingPlot():
         #TODO figure out where this gets called. after moving/adding a point and also modifying fitstart/fit end
 
 class LifetimeSelectionMetadata():
-    def __init__(self, selection, co_selection, decay_plot, series_viewer):
+    def __init__(self, selection : Shapes, co_selection : Points, decay_plot : CurveFittingPlot, series_viewer : SeriesViewer):
         self.selection = selection
         self.co_selection = co_selection
         self.decay_plot = decay_plot
         self.series_viewer = series_viewer
         
     def update_co_selection(self):
-        points = get_bounded_points(self.selection, self.series_viewer.phasor.shape[:2])
-        
+        points = get_bounded_points(self.selection, self.series_viewer.lifetime_image_data[0].shape[:2])
+        # is it possible that the current step changes during this update computation?
+        step = self.series_viewer.get_current_step()
         if(len(points) > 0):
             points_indexer = tuple(np.asarray(points).T)
-            set_points(self.co_selection, self.series_viewer.phasor[points_indexer])
-            histogram = np.mean(self.series_viewer.photon_count[points_indexer],axis=0)
+            set_points(self.co_selection, self.series_viewer.snapshots[step].phasor[points_indexer][:,1:])
+            histogram = np.mean(self.series_viewer.snapshots[step].photon_count[points_indexer],axis=0)
             self.update_decay_plot(histogram)
         else:
-            empty_histogram = np.zeros(self.series_viewer.photon_count.shape[-1]) + np.nan
+            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
             self.update_decay_plot(empty_histogram)
             set_points(self.co_selection, None)
         self.co_selection.editable = False
@@ -364,15 +396,16 @@ class LifetimeSelectionMetadata():
 
 # copied code from above with different coselection updating
 class PhasorSelectionMetadata():
-    def __init__(self, selection, co_selection, decay_plot, series_viewer):
+    def __init__(self, selection : Shapes, co_selection : Points, decay_plot : CurveFittingPlot, series_viewer : SeriesViewer):
         self.selection = selection
         self.co_selection = co_selection
         self.decay_plot = decay_plot
         self.series_viewer = series_viewer
 
     def update_co_selection(self):
+        step = self.series_viewer.get_current_step()
         if len(self.selection.data) == 0:
-            empty_histogram = np.zeros(self.series_viewer.photon_count.shape[-1]) + np.nan
+            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
             self.update_decay_plot(empty_histogram)
             set_points(self.co_selection, None)
             return
@@ -380,9 +413,9 @@ class PhasorSelectionMetadata():
         bounding_center = np.mean(extrema, axis=0)
         bounding_shape = extrema[1] - extrema[0] + np.ones(2, dtype=int) # add one since extremas are inclusive. does this make sense?
         bounding_radius = np.max(bounding_center - extrema[0]) # distance in the p = inf norm
-        height, width, _ = self.series_viewer.phasor.shape
+        height, width = self.series_viewer.get_image_shape()
         maxpoints = width * height
-        distances, indices = self.series_viewer.phasor_quadtree.query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
+        distances, indices = self.series_viewer.snapshots[step].phasor_quadtree.query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
         n_indices = np.searchsorted(distances, np.inf)
         if n_indices > 0:
             indices = indices[0:n_indices]
@@ -394,7 +427,7 @@ class PhasorSelectionMetadata():
             mask = self.selection._data_view.to_masks(mask_shape=bounding_shape, offset=offset).astype(bool)[0]
 
             for point in bounded_points:
-                bounded_phasor = self.series_viewer.phasor[tuple(point)]
+                bounded_phasor = self.series_viewer.snapshots[step].phasor[tuple(point)][1:] # phasor coordinates
                 mask_indexer = tuple(bounded_phasor - offset)
                 # kd tree found a square bounding box. some of these points might be outside of the rectangular mask
                 if mask_indexer[0] < 0 or mask_indexer[1] < 0 or mask_indexer[0] >= bounding_shape[0] or mask_indexer[1] >= bounding_shape[1]:
@@ -407,10 +440,10 @@ class PhasorSelectionMetadata():
                     raise ValueError("Negative index encountered while indexing image layer. This is outside the image!")
                 set_points(self.co_selection, points)
                 points_indexer = tuple(points.T)
-                histogram = np.mean(self.series_viewer.photon_count[points_indexer], axis=0)
+                histogram = np.mean(self.series_viewer.snapshots[step].photon_count[points_indexer], axis=0)
                 self.update_decay_plot(histogram)
         else:
-            empty_histogram = np.zeros(self.series_viewer.photon_count.shape[-1]) + np.nan
+            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
             self.update_decay_plot(empty_histogram)
             set_points(self.co_selection, None)
         self.co_selection.editable = False
@@ -431,7 +464,9 @@ def set_points(points_layer, points, intensity=None):
     except OverflowError:
         # there seems to be a bug in napari with an overflow error
         pass
-    
+    #except ValueError:
+    #    print(points.shape)
+    #    print(points_layer.data.shape)
     if intensity is not None:
         color = np.lib.stride_tricks.as_strided([1.0], shape=(points.shape[0],), strides=(0,))
         points_layer.face_color = np.array([color,color,color,intensity]).T
