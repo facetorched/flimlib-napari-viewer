@@ -469,7 +469,8 @@ def set_points(points_layer, points, intensity=None):
     #    print(points_layer.data.shape)
     if intensity is not None:
         color = np.lib.stride_tricks.as_strided([1.0], shape=(points.shape[0],), strides=(0,))
-        points_layer.face_color = np.array([color,color,color,intensity]).T
+        # TODO using resize to repeat the sequence is a terrible temporary solution
+        points_layer.face_color = np.array([color,color,color,np.resize(intensity, points.shape[0])]).T
     points_layer.selected_data = {}
 
 def select_shape_drag(layer, event):
