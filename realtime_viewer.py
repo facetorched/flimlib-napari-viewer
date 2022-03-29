@@ -124,13 +124,15 @@ class SeriesViewer():
         # TODO does the following create a feedback loop?
         @self.lifetime_viewer.dims.events.current_step.connect
         def lifetime_slider_changed(event):
-            self.phasor_viewer.dims.current_step = self.lifetime_viewer.dims.current_step
-            self.update()
+            if self.snapshots:
+                self.phasor_viewer.dims.current_step = self.lifetime_viewer.dims.current_step
+                self.update()
 
         @self.phasor_viewer.dims.events.current_step.connect
         def phasor_slider_changed(event):
-            self.lifetime_viewer.dims.current_step = self.phasor_viewer.dims.current_step
-            self.update()
+            if self.snapshots:
+                self.lifetime_viewer.dims.current_step = self.phasor_viewer.dims.current_step
+                self.update()
 
         #add the phasor circle
         phasor_circle = np.asarray([[PHASOR_SCALE, 0.5 * PHASOR_SCALE],[0.5 * PHASOR_SCALE,0.5 * PHASOR_SCALE]])
@@ -145,9 +147,14 @@ class SeriesViewer():
         create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
+        self.reset_current_step()
 
     def get_current_step(self):
         return self.lifetime_viewer.dims.current_step[0]
+
+    def reset_current_step(self):
+        self.lifetime_viewer.dims.set_current_step(0,0)
+        self.phasor_viewer.dims.set_current_step(0,0)
     
     def get_tau_axis_size(self):
         return self.snapshots[0].photon_count.shape[-1]
@@ -210,8 +217,6 @@ class SeriesViewer():
         self.lifetime_image.data = ListArray(self.lifetime_image_data)
         # TODO make this memory efficient
         #set_points(self.phasor_image, ListArray(self.phasor_image_data), intensity=phasor_intensity)
-        print(np.max(np.array(self.phasor_image_data).reshape(-1, 3)[:,0]))
-        print(np.array(self.phasor_image_data).reshape(-1, 3).shape)
         #self.phasor_image.data = np.array(self.phasor_image_data).reshape(-1, 3)
         set_points(self.phasor_image, np.array(self.phasor_image_data).reshape(-1, 3), intensity=phasor_intensity)
         self.phasor_image.editable = False
