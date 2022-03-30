@@ -87,8 +87,6 @@ class ListArray:
     def __len__(self):
         return np.prod(self.shape)
 
-# TODO create a class for image layers
-
 @dataclass
 class SnapshotData:
     photon_count : np.ndarray
@@ -113,7 +111,6 @@ class SeriesViewer():
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         autoscale_viewer(self.phasor_viewer, (PHASOR_SCALE, PHASOR_SCALE))
 
-        # TODO must force phasor and lifetime plots to be synchronized in which time they are currently viewing
         self.snapshots = []
         
         self.phasor_image_data = [None,]
@@ -121,7 +118,6 @@ class SeriesViewer():
         self.lifetime_image_data = [None,]
         self.lifetime_image = None
         
-        # TODO does the following create a feedback loop?
         @self.lifetime_viewer.dims.events.current_step.connect
         def lifetime_slider_changed(event):
             if self.snapshots:
@@ -141,6 +137,11 @@ class SeriesViewer():
         phasor_shapes_layer.editable = False
         
         self.colors = color_gen()
+
+        #create dummy image layers
+        self.phasor_image = self.phasor_viewer.add_points(EMPTY_PHASOR_IMAGE, name="Phasor", edge_width=0, size=3)
+        self.phasor_image.editable = False
+        self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
 
         #set up select layers
         create_lifetime_select_layer(self.lifetime_viewer, self.phasor_viewer, self, color=next(self.colors))
@@ -175,9 +176,6 @@ class SeriesViewer():
         if self.fit_end is None:
             self.fit_end = tau_axis_size
         self.max_tau = tau_axis_size * self.period # default is the width of the histogram
-        self.phasor_image = self.phasor_viewer.add_points(EMPTY_PHASOR_IMAGE, name="Phasor", edge_width=0, size=3)
-        self.phasor_image.editable = False
-        self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
         autoscale_viewer(self.lifetime_viewer, self.get_image_shape())
         self.create_options_widget()
         self.create_snap_widget()
@@ -222,7 +220,7 @@ class SeriesViewer():
         self.phasor_image.editable = False
         self.update_selections()
 
-    # TODO selections should only select the current viewed step
+    # TODO selections should only select the current viewed channel (if channels are added)
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
             if 'selection' in layer.metadata:
@@ -372,8 +370,6 @@ class CurveFittingPlot():
         self.fit_start_line.set_data(([fit_start * period, fit_start * period], self.ax.camera._ylim))
         self.fit_end_line.set_data(([fit_end * period, fit_end * period], self.ax.camera._ylim))
 
-        #TODO figure out where this gets called. after moving/adding a point and also modifying fitstart/fit end
-
 class LifetimeSelectionMetadata():
     def __init__(self, selection : Shapes, co_selection : Points, decay_plot : CurveFittingPlot, series_viewer : SeriesViewer):
         self.selection = selection
@@ -502,6 +498,8 @@ def handle_new_shape(event):
 def create_lifetime_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'):
     selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
+    co_viewer.layers.select_previous()
+    co_viewer.layers.move(len(co_viewer.layers)-1)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': LifetimeSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
@@ -510,9 +508,12 @@ def create_lifetime_select_layer(viewer, co_viewer, series_viewer, color='#FF000
     selection.mode = 'select'
     return selection
 
+# TODO according to jenu, selection in phasor and add button isn't needed. phasor should just be viewer
 def create_phasor_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'):
     selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
+    co_viewer.layers.select_previous()
+    co_viewer.layers.move(len(co_viewer.layers)-1)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': PhasorSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
