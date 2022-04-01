@@ -1,4 +1,5 @@
 import colorsys
+from copy import copy
 import logging
 import sys
 import time
@@ -17,6 +18,20 @@ from napari.qt.threading import thread_worker
 from scipy.spatial import KDTree
 from vispy.scene.visuals import Text
 
+from functools import wraps
+from time import time
+
+# copied from stackoverflow.com :)
+def timing(f):
+    @wraps(f)
+    def wrap(*args, **kw):
+        ts = time()
+        result = f(*args, **kw)
+        te = time()
+        print(f'Function {f.__name__} took {te-ts:2.4f} seconds')
+        return result
+    return wrap
+
 FONT_SIZE = 10
 PHASOR_SCALE = 1000
 PHASOR_OPACITY_FACTOR = 0.2
@@ -29,6 +44,9 @@ DEFAULT_PHASOR_POINT = np.array([[PHASOR_SCALE//2, PHASOR_SCALE//2]])
 ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 DEFUALT_MIN_INTENSITY = 10
 DEFUALT_MAX_CHISQ = 200
+NUM_PHASOR_BASE_LAYERS = 2
+NUM_LIFETIME_BASE_LAYERS = 1
+COLORMAP = np.array([colorsys.hsv_to_rgb(f, 1.0, 1) for f in np.linspace(0,1,256)])
 
 class ListArray:
     """An array-like object backed by a list of ndarrays."""
@@ -145,7 +163,7 @@ class SeriesViewer():
 
         #set up select layers
         create_lifetime_select_layer(self.lifetime_viewer, self.phasor_viewer, self, color=next(self.colors))
-        create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
+        #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
         self.reset_current_step()
@@ -197,11 +215,13 @@ class SeriesViewer():
             self.is_compute_thread_running = True
             # Note: the contents of the passed objects are not modified in main thread
             step = self.get_current_step()
+            # TODO photon_count should be either total or since last snapshot
             photon_count = self.snapshots[step].photon_count
             worker = compute(photon_count, self.period, self.fit_start, self.fit_end, step, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
 
+    @timing
     def update_displays(self, arg):
         # this function is where compute thread returns to display thread
         self.is_compute_thread_running = False
@@ -221,6 +241,7 @@ class SeriesViewer():
         self.update_selections()
 
     # TODO selections should only select the current viewed channel (if channels are added)
+    @timing
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
             if 'selection' in layer.metadata:
@@ -228,7 +249,7 @@ class SeriesViewer():
         for layer in self.phasor_viewer.layers:
             if 'selection' in layer.metadata:
                 layer.metadata['selection'].update_co_selection()
-
+    # TODO save json with user settings
     def create_add_selection_widget(self):
         @magicgui(call_button="add lifetime selection")
         def add_lifetime_selection():
@@ -283,33 +304,36 @@ class SeriesViewer():
         @options_widget.end.changed.connect
         def change_end_label(event):
             options_widget.end.label = "Fit End= {:.2f}ns".format(event.value * self.period)
-    
+
+# about 0.004 seconds for 256x256x256 data
+@timing
 def compute_lifetime_image(tau, intensity):
     intensity *= 1.0/intensity.max()
-    tau *= 1.0/np.nanmax(tau)
-    intensity_scaled_tau = np.zeros([*tau.shape,3], dtype=float)
-
-    # temporary colormap (mark suggested a dict map)
-    for r in range(tau.shape[0]):
-        for c in range(tau.shape[1]):
-            if not np.isnan(tau[r][c]):
-                intensity_scaled_tau[r][c] = colorsys.hsv_to_rgb(tau[r][c], 1.0, intensity[r][c])
-
+    tau *= 255/np.nanmax(tau) # TODO uneven bin sizes. last bin is used only if intensity is max
+    np.nan_to_num(tau, copy=False)
+    tau = tau.astype(int)
+    intensity_scaled_tau = COLORMAP[tau]
+    intensity_scaled_tau[...,0] *= intensity
+    intensity_scaled_tau[...,1] *= intensity
+    intensity_scaled_tau[...,2] *= intensity
     return intensity_scaled_tau
 
 def compute_phasor_image(phasor, intensity):
     return phasor.reshape(-1,phasor.shape[-1]), intensity.ravel() * PHASOR_OPACITY_FACTOR
 
 @thread_worker
+@timing
 def compute(photon_count, period, fit_start, fit_end, step, min_intensity, max_chisq, max_tau):
     photon_count = np.asarray(photon_count, dtype=np.float32)
     intensity = photon_count.sum(axis=-1)
+    # about 0.5 sec for 256x256x256 data
     phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     #reshape to work well with mapping / creating the image
     #TODO can i have the last dimension be tuple? this would simplify indexing later
     phasor = np.round(np.dstack([np.full_like(phasor.v, step), (1 - phasor.v) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
     phasor_quadtree = KDTree(phasor.reshape(-1, phasor.shape[-1])[:,1:])
 
+    # about 0.1 sec for 256x256x256 data
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     tau = rld.tau
 
@@ -499,7 +523,7 @@ def create_lifetime_select_layer(viewer, co_viewer, series_viewer, color='#FF000
     selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
     co_viewer.layers.select_previous()
-    co_viewer.layers.move(len(co_viewer.layers)-1)
+    co_viewer.layers.move(len(co_viewer.layers)-1, NUM_PHASOR_BASE_LAYERS)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': LifetimeSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
@@ -513,7 +537,7 @@ def create_phasor_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'
     selection = viewer.add_shapes(ELLIPSE, shape_type='ellipse', name="Selection", face_color=color+"7f", edge_width=0)
     co_selection = co_viewer.add_points(None, name="Correlation", size=1, face_color=color, edge_width=0)
     co_viewer.layers.select_previous()
-    co_viewer.layers.move(len(co_viewer.layers)-1)
+    co_viewer.layers.move(len(co_viewer.layers)-1, NUM_LIFETIME_BASE_LAYERS)
     co_selection.editable = False
     decay_plot = CurveFittingPlot(viewer, scatter_color=color)
     selection.metadata = {'selection': PhasorSelectionMetadata(selection, co_selection, decay_plot, series_viewer)}
