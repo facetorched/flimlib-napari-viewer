@@ -1,7 +1,7 @@
 ############ Copied from napari/_vispy/cameras.py ############
 from vispy.scene.cameras import PanZoomCamera
 import numpy as np
-
+import warnings
 
 class PanZoom1DCamera(PanZoomCamera):
     def __init__(self, axis=1, *args, **kwargs):
@@ -134,23 +134,25 @@ class PlotWidget(VispyPlotWidget):
     def autoscale(self, axes='both'):
         # might be too slow?
         x, y = None, None
-        for visual in self.visuals:
-            data = None
-            if hasattr(visual, '_line'):
-                data = np.array(visual._line._pos).T
-            elif hasattr(visual, '_markers'):
-                data = np.array(visual._markers._data['a_position'])[:, :2].T
-            elif isinstance(visual, scene.Markers):
-                data = np.array(visual._data['a_position'])[:, :2].T
-            if data is not None and len(data.shape):
-                if axes in ('y', 'both'):
-                    y = y if y is not None else [np.inf, -np.inf]
-                    y[1] = np.nanmax((np.nanmax(data[1]), y[1]))
-                    y[0] = np.nanmin((np.nanmin(data[1]), y[0]))
-                if axes in ('x', 'both'):
-                    x = x if x is not None else [np.inf, -np.inf]
-                    x[1] = np.nanmax((np.nanmax(data[0]), x[1]))
-                    x[0] = np.nanmin((np.nanmin(data[0]), x[0]))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            for visual in self.visuals:
+                data = None
+                if hasattr(visual, '_line'):
+                    data = np.array(visual._line._pos).T
+                elif hasattr(visual, '_markers'):
+                    data = np.array(visual._markers._data['a_position'])[:, :2].T
+                elif isinstance(visual, scene.Markers):
+                    data = np.array(visual._data['a_position'])[:, :2].T
+                if data is not None and len(data.shape):
+                    if axes in ('y', 'both'):
+                        y = y if y is not None else [np.inf, -np.inf]
+                        y[1] = np.nanmax((np.nanmax(data[1]), y[1]))
+                        y[0] = np.nanmin((np.nanmin(data[1]), y[0]))
+                    if axes in ('x', 'both'):
+                        x = x if x is not None else [np.inf, -np.inf]
+                        x[1] = np.nanmax((np.nanmax(data[0]), x[1]))
+                        x[0] = np.nanmin((np.nanmin(data[0]), x[0]))
         x = None if np.any(np.isnan(x)) else x
         y = None if np.any(np.isnan(y)) else y
         self.view.camera.set_range(x, y, margin=0.005)
