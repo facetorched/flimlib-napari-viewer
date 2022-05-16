@@ -121,6 +121,7 @@ class SeriesViewer():
         self.min_intensity=DEFUALT_MIN_INTENSITY
         self.max_chisq=DEFUALT_MAX_CHISQ
         self.max_tau=np.inf
+        self.snapshot_frames = False
         self.is_compute_thread_running = False
         self.is_cumulative = False
 
@@ -215,8 +216,11 @@ class SeriesViewer():
             self.is_compute_thread_running = True
             # Note: the contents of the passed objects are not modified in main thread
             step = self.get_current_step()
-            # TODO photon_count should be either total or since last snapshot
-            photon_count = self.snapshots[step].photon_count
+            # if these snapshots are frames, we want to subtract the previous snapshot
+            if self.snapshot_frames and step > 0:
+                photon_count = self.snapshots[step].photon_count - self.snapshots[step - 1].photon_count
+            else:
+                photon_count = self.snapshots[step].photon_count
             worker = compute(photon_count, self.period, self.fit_start, self.fit_end, step, self.min_intensity, self.max_chisq, self.max_tau)
             worker.returned.connect(self.update_displays)
             worker.start()
@@ -280,6 +284,7 @@ class SeriesViewer():
             mini={"label": "Min Intensity"},
             maxc={"label": "Max χ2"},
             maxt={"label": "Max Lifetime"},
+            snapf={"label": "Snapshots are frames"}
             )
         def options_widget(
             pd : float = self.period,
@@ -287,7 +292,8 @@ class SeriesViewer():
             end : int = self.fit_end,
             mini : int = self.min_intensity,
             maxc : int = self.max_chisq,
-            maxt : float = self.max_tau
+            maxt : float = self.max_tau,
+            snapf : bool = self.snapshot_frames,
         ):
             self.period = pd
             self.fit_start = start
@@ -295,6 +301,7 @@ class SeriesViewer():
             self.min_intensity = mini
             self.max_chisq = maxc
             self.max_tau = maxt
+            self.snapshot_frames = snapf
             self.update()
         self.lifetime_viewer.window.add_dock_widget(options_widget, area='left')
         
