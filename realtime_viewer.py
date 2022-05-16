@@ -183,6 +183,7 @@ class SeriesViewer():
         """returns shape of the image (height, width)"""
         return self.snapshots[0].photon_count.shape[-3:-1]
 
+    @timing
     def setup(self):
         """
         setup occurs after the first frame has arrived. 
@@ -303,7 +304,7 @@ class SeriesViewer():
             self.max_tau = maxt
             self.snapshot_frames = snapf
             self.update()
-        self.lifetime_viewer.window.add_dock_widget(options_widget, area='left')
+        self.lifetime_viewer.window.add_dock_widget(options_widget, area='bottom')
         
         @options_widget.start.changed.connect
         def change_start_label(event):
