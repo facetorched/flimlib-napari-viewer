@@ -339,14 +339,14 @@ def compute(photon_count, period, fit_start, fit_end, step, min_intensity, max_c
     photon_count = np.asarray(photon_count, dtype=np.float32)
     intensity = photon_count.sum(axis=-1)
     # about 0.5 sec for 256x256x256 data
-    phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end)
+    phasor = flimlib.GCI_Phasor(period, photon_count, fit_start=fit_start, fit_end=fit_end, compute_fitted=False)
     #reshape to work well with mapping / creating the image
     #TODO can i have the last dimension be tuple? this would simplify indexing later
     phasor = np.round(np.dstack([np.full_like(phasor.v, step), (1 - phasor.v) * PHASOR_SCALE, phasor.u * PHASOR_SCALE])).astype(int)
     phasor_quadtree = KDTree(phasor.reshape(-1, phasor.shape[-1])[:,1:])
 
     # about 0.1 sec for 256x256x256 data
-    rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
+    rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end, compute_residuals=False)
     tau = rld.tau
 
     tau[intensity < min_intensity] = np.nan
