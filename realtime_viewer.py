@@ -264,8 +264,12 @@ class SeriesViewer():
         def add_phasor_selection():
             create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
 
-        self.lifetime_viewer.window.add_dock_widget(add_lifetime_selection, area='left')
-        self.phasor_viewer.window.add_dock_widget(add_phasor_selection, area='left')
+        add_lifetime_dw = self.lifetime_viewer.window.add_dock_widget(add_lifetime_selection, name='add lifetime selection', area='left')
+        add_phasor_dw = self.phasor_viewer.window.add_dock_widget(add_phasor_selection, name = 'add phasor selection', area='left')
+
+        # TODO remove access to private member
+        add_lifetime_dw._close_btn = False
+        add_phasor_dw._close_btn = False
 
     def create_snap_widget(self):
         @magicgui(call_button="snap")
@@ -372,6 +376,10 @@ class CurveFittingPlot():
         self.fig = Fig()
         # add a docked figure
         self.dock_widget = viewer.window.add_dock_widget(self.fig, area='bottom')
+        # TODO remove access to private member
+        self.dock_widget._close_btn = False
+        # TODO float button crashes the entire app. Couldn't find a way to remove it. Fix the crash?
+        
         # get a handle to the plotWidget
         self.ax = self.fig[0, 0]
         self.lm_curve = self.ax.plot(None, color='g', marker_size=0, width=2)
