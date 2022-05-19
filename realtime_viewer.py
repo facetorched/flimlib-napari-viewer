@@ -1,6 +1,7 @@
 import colorsys
-from copy import copy
+import copy
 import logging
+import os
 import sys
 import time
 
@@ -43,7 +44,7 @@ DEFAULT_POINT = np.zeros((1,2))
 DEFAULT_PHASOR_POINT = np.array([[PHASOR_SCALE//2, PHASOR_SCALE//2]])
 ELLIPSE = np.array([[59, 222], [110, 289], [170, 243], [119, 176]])
 DEFUALT_MIN_INTENSITY = 10
-DEFUALT_MAX_CHISQ = 200
+DEFUALT_MAX_CHISQ = 200.0
 NUM_PHASOR_BASE_LAYERS = 2
 NUM_LIFETIME_BASE_LAYERS = 1
 COLORMAP = np.array([colorsys.hsv_to_rgb(f, 1.0, 1) for f in np.linspace(0,1,256)])
@@ -111,21 +112,33 @@ class SnapshotData:
     phasor : np.ndarray
     phasor_quadtree : KDTree
 
+@dataclass
+class UserParameters:
+    # Warning, members must not be mutable since copies of this class are made
+    period : float
+    fit_start : int
+    fit_end : int
+    min_intensity : int
+    max_chisq : float
+    max_tau : float
+    is_snapshot_frames : bool
+
 class SeriesViewer():
 
     def __init__(self, period=.04, fit_start=None, fit_end=None):
-        # series viewer parameters
-        self.period = period
-        self.fit_start=fit_start
-        self.fit_end=fit_end
-        self.min_intensity=DEFUALT_MIN_INTENSITY
-        self.max_chisq=DEFUALT_MAX_CHISQ
-        self.max_tau=np.inf
-        self.snapshot_frames = False
-        self.is_compute_thread_running = False
-        self.is_cumulative = False
+        # user parameters
+        self.params = UserParameters(
+            period = period,
+            fit_start=fit_start,
+            fit_end=fit_end,
+            min_intensity=DEFUALT_MIN_INTENSITY,
+            max_chisq=DEFUALT_MAX_CHISQ,
+            max_tau=np.inf,
+            is_snapshot_frames = False,
+        )
 
-        # objects within series viewer (only one of each of these)
+        # class members
+        self.is_compute_thread_running = False
         self.lifetime_viewer = napari.Viewer(title="Lifetime Viewer")
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         autoscale_viewer(self.phasor_viewer, (PHASOR_SCALE, PHASOR_SCALE))
@@ -167,6 +180,7 @@ class SeriesViewer():
         #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
+        self.create_save_widget()
         self.reset_current_step()
 
     def get_current_step(self):
@@ -191,11 +205,11 @@ class SeriesViewer():
         """
         first = self.snapshots[0].photon_count
         tau_axis_size = self.get_tau_axis_size()
-        if self.fit_start is None:
-            self.fit_start = int(np.argmax(first.reshape(-1, tau_axis_size).sum(axis=0))) #estimate fit start
-        if self.fit_end is None:
-            self.fit_end = tau_axis_size
-        self.max_tau = tau_axis_size * self.period # default is the width of the histogram
+        if self.params.fit_start is None:
+            self.params.fit_start = int(np.argmax(first.reshape(-1, tau_axis_size).sum(axis=0))) #estimate fit start
+        if self.params.fit_end is None:
+            self.params.fit_end = tau_axis_size
+        self.params.max_tau = tau_axis_size * self.params.period # default is the width of the histogram
         autoscale_viewer(self.lifetime_viewer, self.get_image_shape())
         self.create_options_widget()
         self.create_snap_widget()
@@ -218,11 +232,14 @@ class SeriesViewer():
             # Note: the contents of the passed objects are not modified in main thread
             step = self.get_current_step()
             # if these snapshots are frames, we want to subtract the previous snapshot
-            if self.snapshot_frames and step > 0:
+            if self.params.is_snapshot_frames and step > 0:
                 photon_count = self.snapshots[step].photon_count - self.snapshots[step - 1].photon_count
             else:
                 photon_count = self.snapshots[step].photon_count
-            worker = compute(photon_count, self.period, self.fit_start, self.fit_end, step, self.min_intensity, self.max_chisq, self.max_tau)
+            # TODO check that this copy is necessary
+            # make a copy to maintain thread safety
+            params_copy = copy.copy(self.params)
+            worker = compute(photon_count, params_copy, step)
             worker.returned.connect(self.update_displays)
             worker.start()
 
@@ -284,38 +301,53 @@ class SeriesViewer():
         tau_axis_size = self.get_tau_axis_size()
         @magicgui(auto_call=True, 
             pd={"label" : "Period (ns)"},
-            start={"label": "Fit Start= {:.2f}ns".format(self.fit_start * self.period), "min": 0, "max": tau_axis_size - 1}, 
-            end={"label": "Fit End= {:.2f}ns".format(self.fit_end * self.period),"min": 1, "max": tau_axis_size},
+            start={"label": "Fit Start= {:.2f}ns".format(self.params.fit_start * self.params.period), "min": 0, "max": tau_axis_size - 1}, 
+            end={"label": "Fit End= {:.2f}ns".format(self.params.fit_end * self.params.period),"min": 1, "max": tau_axis_size},
             mini={"label": "Min Intensity"},
             maxc={"label": "Max χ2"},
             maxt={"label": "Max Lifetime"},
             snapf={"label": "Snapshots are frames"}
             )
         def options_widget(
-            pd : float = self.period,
-            start : int = self.fit_start,
-            end : int = self.fit_end,
-            mini : int = self.min_intensity,
-            maxc : int = self.max_chisq,
-            maxt : float = self.max_tau,
-            snapf : bool = self.snapshot_frames,
+            pd : float = self.params.period,
+            start : int = self.params.fit_start,
+            end : int = self.params.fit_end,
+            mini : int = self.params.min_intensity,
+            maxc : float = self.params.max_chisq,
+            maxt : float = self.params.max_tau,
+            snapf : bool = self.params.is_snapshot_frames,
         ):
-            self.period = pd
-            self.fit_start = start
-            self.fit_end = end
-            self.min_intensity = mini
-            self.max_chisq = maxc
-            self.max_tau = maxt
-            self.snapshot_frames = snapf
+            self.params.period = pd
+            self.params.fit_start = start
+            self.params.fit_end = end
+            self.params.min_intensity = mini
+            self.params.max_chisq = maxc
+            self.params.max_tau = maxt
+            self.params.is_snapshot_frames = snapf
             self.update()
-        self.lifetime_viewer.window.add_dock_widget(options_widget, area='bottom')
+        self.lifetime_viewer.window.add_dock_widget(options_widget, name ='options', area='bottom')
         
         @options_widget.start.changed.connect
         def change_start_label(event):
-            options_widget.start.label = "Fit Start= {:.2f}ns".format(event.value * self.period)
+            options_widget.start.label = "Fit Start= {:.2f}ns".format(event.value * self.params.period)
         @options_widget.end.changed.connect
         def change_end_label(event):
-            options_widget.end.label = "Fit End= {:.2f}ns".format(event.value * self.period)
+            options_widget.end.label = "Fit End= {:.2f}ns".format(event.value * self.params.period)
+
+    def create_save_widget(self):
+        @magicgui(
+            call_button="save",
+            dir={'label': 'directory'},
+            load={'widget_type' : 'PushButton', 'label' : 'load'}
+        )
+        def func(dir: str = '.', load=True):
+            print('running func with', os.path.abspath(dir))
+
+        def callback():
+            print(f'running callback with {func.dir.value=}')
+
+        func.load.clicked.connect(callback)
+        self.lifetime_viewer.window.add_dock_widget(func, area='left')
 
 # about 0.004 seconds for 256x256x256 data
 @timing
@@ -335,7 +367,10 @@ def compute_phasor_image(phasor, intensity):
 
 @thread_worker
 @timing
-def compute(photon_count, period, fit_start, fit_end, step, min_intensity, max_chisq, max_tau):
+def compute(photon_count, params : UserParameters, step):
+    period = params.period
+    fit_start = params.fit_start
+    fit_end = params.fit_end
     photon_count = np.asarray(photon_count, dtype=np.float32)
     intensity = photon_count.sum(axis=-1)
     # about 0.5 sec for 256x256x256 data
@@ -349,18 +384,21 @@ def compute(photon_count, period, fit_start, fit_end, step, min_intensity, max_c
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end, compute_residuals=False)
     tau = rld.tau
 
-    tau[intensity < min_intensity] = np.nan
-    tau[rld.chisq > max_chisq] = np.nan
+    tau[intensity < params.min_intensity] = np.nan
+    tau[rld.chisq > params.max_chisq] = np.nan
     # negative lifetimes are not valid
     tau[tau<0] = np.nan 
-    tau[tau > max_tau] = np.nan
+    tau[tau > params.max_tau] = np.nan
 
     lifetime_image = compute_lifetime_image(tau, intensity)
     phasor_image, phasor_intensity = compute_phasor_image(phasor, intensity)
 
     return phasor, phasor_quadtree, phasor_image, phasor_intensity, lifetime_image, step
 
-def compute_fits(photon_count, period, fit_start, fit_end):
+def compute_fits(photon_count, params : UserParameters):
+    period = params.period
+    fit_start = params.fit_start
+    fit_end = params.fit_end
     rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
     param_in = [rld.Z, rld.A, rld.tau]
     lm = flimlib.GCI_marquardt_fitting_engine(period, photon_count, param_in, fit_start=fit_start, fit_end=fit_end)
@@ -391,9 +429,12 @@ class CurveFittingPlot():
         self.rld_info = Text(None, parent=self.ax.view, color='r', anchor_x='right', font_size = FONT_SIZE)
         self.lm_info = Text(None, parent=self.ax.view, color='g', anchor_x='right', font_size = FONT_SIZE)
     
-    def update_with_selection(self, selection, period, fit_start, fit_end):
-        rld_selected, lm_selected = compute_fits(selection, period, fit_start, fit_end)
-        time = np.linspace(0, lm_selected.fitted.size * period, lm_selected.fitted.size, endpoint=False, dtype=np.float32)
+    def update_with_selection(self, selection, params : UserParameters):
+        rld_selected, lm_selected = compute_fits(selection, params)
+        period = params.period
+        fit_start = params.fit_start
+        fit_end = params.fit_end
+        time = np.linspace(0, lm_selected.fitted.size * params.period, lm_selected.fitted.size, endpoint=False, dtype=np.float32)
         fit_time = time[fit_start:fit_end]
         self.lm_curve.set_data((fit_time, lm_selected.fitted[fit_start:fit_end]))
         self.rld_curve.set_data((fit_time, rld_selected.fitted[fit_start:fit_end]))
@@ -433,7 +474,7 @@ class LifetimeSelectionMetadata():
         self.co_selection.editable = False
 
     def update_decay_plot(self, selection):
-        self.decay_plot.update_with_selection(selection, self.series_viewer.period, self.series_viewer.fit_start, self.series_viewer.fit_end)
+        self.decay_plot.update_with_selection(selection, self.series_viewer.params)
 
 # copied code from above with different coselection updating
 class PhasorSelectionMetadata():
@@ -491,7 +532,7 @@ class PhasorSelectionMetadata():
         
 
     def update_decay_plot(self, selection):
-        self.decay_plot.update_with_selection(selection, self.series_viewer.period, self.series_viewer.fit_start, self.series_viewer.fit_end)
+        self.decay_plot.update_with_selection(selection, self.series_viewer.params)
 
 def get_points(layer: Shapes):
         return get_bounded_points(layer, None)
