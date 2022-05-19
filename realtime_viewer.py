@@ -1,5 +1,7 @@
 import colorsys
 import copy
+import dataclasses
+import json
 import logging
 import os
 import sys
@@ -18,6 +20,11 @@ from magicgui import magicgui
 from napari.qt.threading import thread_worker
 from scipy.spatial import KDTree
 from vispy.scene.visuals import Text
+
+# need these for file dialogue?
+from PyQt5.QtWidgets import QFileDialog
+from PyQt5.QtWidgets import QWidget
+#from PyQt5 import QtGui
 
 from functools import wraps
 from time import time
@@ -156,6 +163,7 @@ class SeriesViewer():
                 self.phasor_viewer.dims.current_step = self.lifetime_viewer.dims.current_step
                 self.update()
 
+        # TODO remove this!!! (phasor should not have steps)
         @self.phasor_viewer.dims.events.current_step.connect
         def phasor_slider_changed(event):
             if self.snapshots:
@@ -180,7 +188,6 @@ class SeriesViewer():
         #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
-        self.create_save_widget()
         self.reset_current_step()
 
     def get_current_step(self):
@@ -236,9 +243,8 @@ class SeriesViewer():
                 photon_count = self.snapshots[step].photon_count - self.snapshots[step - 1].photon_count
             else:
                 photon_count = self.snapshots[step].photon_count
-            # TODO check that this copy is necessary
             # make a copy to maintain thread safety
-            params_copy = copy.copy(self.params)
+            params_copy = copy.deepcopy(self.params)
             worker = compute(photon_count, params_copy, step)
             worker.returned.connect(self.update_displays)
             worker.start()
@@ -295,59 +301,96 @@ class SeriesViewer():
             self.snapshots += [SnapshotData(prev.photon_count, prev.phasor, prev.phasor_quadtree)]
             self.lifetime_image_data += [self.lifetime_image_data[-1]]
             self.phasor_image_data += [self.phasor_image_data[-1]]
-        self.lifetime_viewer.window.add_dock_widget(snap, area='left')
+        self.lifetime_viewer.window.add_dock_widget(snap, name='snapshot', area='left')
 
     def create_options_widget(self):
         tau_axis_size = self.get_tau_axis_size()
         @magicgui(auto_call=True, 
-            pd={"label" : "Period (ns)"},
-            start={"label": "Fit Start= {:.2f}ns".format(self.params.fit_start * self.params.period), "min": 0, "max": tau_axis_size - 1}, 
-            end={"label": "Fit End= {:.2f}ns".format(self.params.fit_end * self.params.period),"min": 1, "max": tau_axis_size},
-            mini={"label": "Min Intensity"},
-            maxc={"label": "Max χ2"},
-            maxt={"label": "Max Lifetime"},
-            snapf={"label": "Snapshots are frames"}
+            period={"label" : "Period (ns)"},
+            fit_start={"label": "Fit Start= {:.2f}ns".format(self.params.fit_start * self.params.period), "min": 0, "max": tau_axis_size - 1}, 
+            fit_end={"label": "Fit End= {:.2f}ns".format(self.params.fit_end * self.params.period),"min": 1, "max": tau_axis_size},
+            min_intensity={"label": "Min Intensity"},
+            max_chisq={"label": "Max χ2"},
+            max_tau={"label": "Max Lifetime"},
+            is_snapshot_frames={"label": "Snapshots are frames"}
             )
         def options_widget(
-            pd : float = self.params.period,
-            start : int = self.params.fit_start,
-            end : int = self.params.fit_end,
-            mini : int = self.params.min_intensity,
-            maxc : float = self.params.max_chisq,
-            maxt : float = self.params.max_tau,
-            snapf : bool = self.params.is_snapshot_frames,
+            period : float = self.params.period,
+            fit_start : int = self.params.fit_start,
+            fit_end : int = self.params.fit_end,
+            min_intensity : int = self.params.min_intensity,
+            max_chisq : float = self.params.max_chisq,
+            max_tau : float = self.params.max_tau,
+            is_snapshot_frames : bool = self.params.is_snapshot_frames,
         ):
-            self.params.period = pd
-            self.params.fit_start = start
-            self.params.fit_end = end
-            self.params.min_intensity = mini
-            self.params.max_chisq = maxc
-            self.params.max_tau = maxt
-            self.params.is_snapshot_frames = snapf
+            self.params.period = period
+            self.params.fit_start = fit_start
+            self.params.fit_end = fit_end
+            self.params.min_intensity = min_intensity
+            self.params.max_chisq = max_chisq
+            self.params.max_tau = max_tau
+            self.params.is_snapshot_frames = is_snapshot_frames
             self.update()
-        self.lifetime_viewer.window.add_dock_widget(options_widget, name ='options', area='bottom')
         
-        @options_widget.start.changed.connect
-        def change_start_label(event):
-            options_widget.start.label = "Fit Start= {:.2f}ns".format(event.value * self.params.period)
-        @options_widget.end.changed.connect
-        def change_end_label(event):
-            options_widget.end.label = "Fit End= {:.2f}ns".format(event.value * self.params.period)
+        self.lifetime_viewer.window.add_dock_widget(options_widget, name ='parameters', area='right')
 
-    def create_save_widget(self):
+        def set_options_widget(params : UserParameters):
+            options_widget.period.value = params.period
+            options_widget.fit_start.value = params.fit_start
+            options_widget.fit_end.value = params.fit_end
+            options_widget.min_intensity.value = params.min_intensity
+            options_widget.max_chisq.value = params.max_chisq
+            options_widget.max_tau.value = params.max_tau
+            options_widget.is_snapshot_frames.value = params.is_snapshot_frames
+
+        @options_widget.fit_start.changed.connect
+        def change_start_label(event):
+            options_widget.fit_start.label = "Fit Start= {:.2f}ns".format(event * self.params.period)
+        @options_widget.fit_end.changed.connect
+        def change_end_label(event):
+            options_widget.fit_end.label = "Fit End= {:.2f}ns".format(event * self.params.period)
+
+        class FileSelector(QWidget):
+            def save_file(self):
+                filepath = QFileDialog.getSaveFileName(self, "Save Parameters", "./untitled.json", "Json (*.json)")
+                save_widget.filepath.value = filepath[0] # set the value in the widget
+                return filepath[0]
+            def load_file(self):
+                filepath = QFileDialog.getOpenFileName(self, "Load Parameters", "./untitled.json", "Json (*.json)")
+                save_widget.filepath.value = filepath[0] # set the value in the widget
+                return filepath[0]
+
         @magicgui(
             call_button="save",
-            dir={'label': 'directory'},
+            filepath={'label': 'filepath'},
             load={'widget_type' : 'PushButton', 'label' : 'load'}
         )
-        def func(dir: str = '.', load=True):
-            print('running func with', os.path.abspath(dir))
+        def save_widget(filepath='', load=True):
+            if not filepath:
+                fs = FileSelector()
+                # TODO does this freeze everything else until user selects something?
+                filepath = fs.save_file()
+            print('saving parameters to', os.path.abspath(filepath))
+            with open(filepath,'w') as outfile:
+                json.dump(dataclasses.asdict(self.params), outfile, indent=4)
 
-        def callback():
-            print(f'running callback with {func.dir.value=}')
+        def load_callback():
+            filepath = save_widget.filepath.value
+            if not filepath:
+                fs = FileSelector()
+                # TODO does this freeze everything else until user selects something?
+                filepath = fs.load_file()
+            print('loading parameters from', os.path.abspath(filepath))
+            with open(filepath,'r') as infile:
+                params_dict = json.load(infile)
+                # the following only works if UserParameters continues to have only simple types
+                set_options_widget(UserParameters(**params_dict))
 
-        func.load.clicked.connect(callback)
-        self.lifetime_viewer.window.add_dock_widget(func, area='left')
+        save_widget.load.clicked.connect(load_callback)
+        self.lifetime_viewer.window.add_dock_widget(save_widget, name='save parameters', area='right')
+
+
+
 
 # about 0.004 seconds for 256x256x256 data
 @timing
