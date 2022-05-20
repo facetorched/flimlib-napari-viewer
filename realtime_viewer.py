@@ -140,7 +140,7 @@ class SeriesViewer():
             fit_end=fit_end,
             min_intensity=DEFUALT_MIN_INTENSITY,
             max_chisq=DEFUALT_MAX_CHISQ,
-            max_tau=np.inf,
+            max_tau=None,
             is_snapshot_frames = False,
         )
 
@@ -149,7 +149,7 @@ class SeriesViewer():
         self.lifetime_viewer = napari.Viewer(title="Lifetime Viewer")
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
         autoscale_viewer(self.phasor_viewer, (PHASOR_SCALE, PHASOR_SCALE))
-
+        self.options_widget = None
         self.snapshots = []
         
         self.phasor_image_data = [None,]
@@ -188,6 +188,8 @@ class SeriesViewer():
         #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
+        self.create_options_widget()
+        self.create_snap_widget()
         self.reset_current_step()
 
     def get_current_step(self):
@@ -204,29 +206,34 @@ class SeriesViewer():
         """returns shape of the image (height, width)"""
         return self.snapshots[0].photon_count.shape[-3:-1]
 
+    def has_data(self):
+        return bool(self.snapshots)
+
     @timing
     def setup(self):
         """
         setup occurs after the first frame has arrived. 
         At this point we know what shape the incoming data is
         """
-        first = self.snapshots[0].photon_count
         tau_axis_size = self.get_tau_axis_size()
+        summed_photon_count = self.snapshots[0].photon_count.reshape(-1, tau_axis_size).sum(axis=0)
+        
         if self.params.fit_start is None:
-            self.params.fit_start = int(np.argmax(first.reshape(-1, tau_axis_size).sum(axis=0))) #estimate fit start
+            self.params.fit_start = int(np.argmax(summed_photon_count)) #estimate fit start as the max in the data
         if self.params.fit_end is None:
-            self.params.fit_end = tau_axis_size
+            self.params.fit_end = int(np.max(np.nonzero(summed_photon_count)) + 1) # estimate fit end as bounding the last nonzero data
         self.params.max_tau = tau_axis_size * self.params.period # default is the width of the histogram
+        params_copy = copy.deepcopy(self.params)
+        self.setup_options_widget()
+        self.update_options_widget(params_copy)
         autoscale_viewer(self.lifetime_viewer, self.get_image_shape())
-        self.create_options_widget()
-        self.create_snap_widget()
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
         # for now, we ignore all but the first channel
         photon_count = photon_count[tuple([0] * (photon_count.ndim - 3))]
         # check if this is the first time receiving data
-        if not self.snapshots:
+        if not self.has_data():
             self.snapshots += [SnapshotData(photon_count,None,None)]
             self.setup()
         else:
@@ -297,18 +304,18 @@ class SeriesViewer():
     def create_snap_widget(self):
         @magicgui(call_button="snap")
         def snap():
-            prev = self.snapshots[-1]
-            self.snapshots += [SnapshotData(prev.photon_count, prev.phasor, prev.phasor_quadtree)]
-            self.lifetime_image_data += [self.lifetime_image_data[-1]]
-            self.phasor_image_data += [self.phasor_image_data[-1]]
+            if self.has_data():
+                prev = self.snapshots[-1]
+                self.snapshots += [SnapshotData(prev.photon_count, prev.phasor, prev.phasor_quadtree)]
+                self.lifetime_image_data += [self.lifetime_image_data[-1]]
+                self.phasor_image_data += [self.phasor_image_data[-1]]
         self.lifetime_viewer.window.add_dock_widget(snap, name='snapshot', area='left')
 
     def create_options_widget(self):
-        tau_axis_size = self.get_tau_axis_size()
         @magicgui(auto_call=True, 
             period={"label" : "Period (ns)"},
-            fit_start={"label": "Fit Start= {:.2f}ns".format(self.params.fit_start * self.params.period), "min": 0, "max": tau_axis_size - 1}, 
-            fit_end={"label": "Fit End= {:.2f}ns".format(self.params.fit_end * self.params.period),"min": 1, "max": tau_axis_size},
+            fit_start={"label": "Fit Start"}, 
+            fit_end={"label": "Fit End"},
             min_intensity={"label": "Min Intensity"},
             max_chisq={"label": "Max χ2"},
             max_tau={"label": "Max Lifetime"},
@@ -330,18 +337,11 @@ class SeriesViewer():
             self.params.max_chisq = max_chisq
             self.params.max_tau = max_tau
             self.params.is_snapshot_frames = is_snapshot_frames
-            self.update()
+            if self.has_data:
+                self.update()
         
         self.lifetime_viewer.window.add_dock_widget(options_widget, name ='parameters', area='right')
-
-        def set_options_widget(params : UserParameters):
-            options_widget.period.value = params.period
-            options_widget.fit_start.value = params.fit_start
-            options_widget.fit_end.value = params.fit_end
-            options_widget.min_intensity.value = params.min_intensity
-            options_widget.max_chisq.value = params.max_chisq
-            options_widget.max_tau.value = params.max_tau
-            options_widget.is_snapshot_frames.value = params.is_snapshot_frames
+        self.options_widget = options_widget
 
         @options_widget.fit_start.changed.connect
         def change_start_label(event):
@@ -359,6 +359,8 @@ class SeriesViewer():
                 filepath = QFileDialog.getOpenFileName(self, "Load Parameters", "./untitled.json", "Json (*.json)")
                 save_widget.filepath.value = filepath[0] # set the value in the widget
                 return filepath[0]
+
+        # TODO https://napari.org/magicgui/usage/_autosummary/magicgui.widgets.FileEdit.html
 
         @magicgui(
             call_button="save",
@@ -384,12 +386,26 @@ class SeriesViewer():
             with open(filepath,'r') as infile:
                 params_dict = json.load(infile)
                 # the following only works if UserParameters continues to have only simple types
-                set_options_widget(UserParameters(**params_dict))
+                self.update_options_widget(UserParameters(**params_dict))
 
         save_widget.load.clicked.connect(load_callback)
         self.lifetime_viewer.window.add_dock_widget(save_widget, name='save parameters', area='right')
+    
+    def setup_options_widget(self):
+        tau_axis_size = self.get_tau_axis_size()
+        self.options_widget.fit_start.min = 0
+        self.options_widget.fit_start.max = tau_axis_size - 1
+        self.options_widget.fit_end.min = 1
+        self.options_widget.fit_end.max = tau_axis_size
 
-
+    def update_options_widget(self, params : UserParameters):
+        self.options_widget.period.value = params.period
+        self.options_widget.fit_start.value = params.fit_start
+        self.options_widget.fit_end.value = params.fit_end
+        self.options_widget.min_intensity.value = params.min_intensity
+        self.options_widget.max_chisq.value = params.max_chisq
+        self.options_widget.max_tau.value = params.max_tau
+        self.options_widget.is_snapshot_frames.value = params.is_snapshot_frames
 
 
 # about 0.004 seconds for 256x256x256 data
