@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+from typing import List
 
 import flimlib
 import h5py
@@ -54,7 +55,8 @@ DEFUALT_MIN_INTENSITY = 10
 DEFUALT_MAX_CHISQ = 200.0
 NUM_PHASOR_BASE_LAYERS = 2
 NUM_LIFETIME_BASE_LAYERS = 1
-COLORMAP = np.array([colorsys.hsv_to_rgb(f, 1.0, 1) for f in np.linspace(0,1,256)])
+COLOR_DEPTH = 256
+COLORMAP = np.array([colorsys.hsv_to_rgb(f, 1.0, 1) for f in np.linspace(0,1,COLOR_DEPTH)])
 
 class ListArray:
     """An array-like object backed by a list of ndarrays."""
@@ -113,11 +115,81 @@ class ListArray:
     def __len__(self):
         return np.prod(self.shape)
 
+
+
+@dataclass
+class SnapshotResults:
+    phasor : np.ndarray
+    phasor_quadtree : KDTree
+    lifetime_image : np.ndarray
+    phasor_image : np.ndarray
+    phasor_intensity : np.ndarray
+
 @dataclass
 class SnapshotData:
     photon_count : np.ndarray
-    phasor : np.ndarray
-    phasor_quadtree : KDTree
+    results : SnapshotResults
+
+class LifetimeImageProxy:
+    """
+    An array-like object backed by the collection of lifetime_image 
+    members within each of the snapshot results
+    """
+
+    def __init__(self, snap_list : List[SnapshotData]):
+        if not len(snap_list):
+            raise ValueError # At least for now, don't allow empty
+
+        self._arrays = []
+        self._dtype = None
+        self._shape = None
+        for a in snap_list:
+            self._arrays.append(np.asarray(a.results.lifetime_image))
+            if self._dtype is None:
+                self._dtype = self._arrays[0].dtype
+            elif self._arrays[-1].dtype != self._dtype:
+                raise ValueError
+            if self._shape is None:
+                self._shape = self._arrays[0].shape
+            elif self._arrays[-1].shape != self._shape:
+                raise ValueError
+
+    @property
+    def ndim(self):
+        return 1 + len(self._shape)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def shape(self):
+        return (len(self._arrays),) + self._shape
+
+    def __getitem__(self, slices):
+        if not isinstance(slices, tuple):
+            slices = (slices,)
+        ndslices = slices[1:]
+        s0 = slices[0]
+        if isinstance(s0, slice):
+            start, stop, step = s0.indices(len(self._arrays))
+            dim0 = (stop - start) // step
+            shape = (dim0,) + self._shape
+            ret = np.empty_like(self._arrays[0], shape=shape)
+            j0 = 0
+            for i0 in range(start, stop, step):
+                ret[j0] = self._arrays[i0][ndslices]
+                j0 += 1
+            return ret
+        else:  # s0 is an integer
+            return self._arrays[s0][ndslices]
+
+    def __array__(self):
+        print("################## NAPARI IS REQUESTING AN NDARRAY #####################")
+        return self[:]
+    
+    def __len__(self):
+        return np.prod(self.shape)
 
 @dataclass
 class UserParameters:
@@ -306,7 +378,10 @@ class SeriesViewer():
         def snap():
             if self.has_data():
                 prev = self.snapshots[-1]
-                self.snapshots += [SnapshotData(prev.photon_count, prev.phasor, prev.phasor_quadtree)]
+                self.snapshots += [SnapshotData(
+                    photon_count=prev.photon_count, 
+                    phasor=prev.phasor, 
+                    phasor_quadtree=prev.phasor_quadtree)]
                 self.lifetime_image_data += [self.lifetime_image_data[-1]]
                 self.phasor_image_data += [self.phasor_image_data[-1]]
         self.lifetime_viewer.window.add_dock_widget(snap, name='snapshot', area='left')
@@ -412,9 +487,10 @@ class SeriesViewer():
 @timing
 def compute_lifetime_image(tau, intensity):
     intensity *= 1.0/intensity.max()
-    tau *= 255/np.nanmax(tau) # TODO uneven bin sizes. last bin is used only if intensity is max
+    tau *= (COLOR_DEPTH)/np.nanmax(tau)
     np.nan_to_num(tau, copy=False)
     tau = tau.astype(int)
+    tau[tau >= COLOR_DEPTH] = COLOR_DEPTH - 1 # this value is used to index into the colormap
     intensity_scaled_tau = COLORMAP[tau]
     intensity_scaled_tau[...,0] *= intensity
     intensity_scaled_tau[...,1] *= intensity
