@@ -313,7 +313,7 @@ class PlotWidget(VispyPlotWidget):
             data,
             connect=connect,
             color=color,
-            symbol=symbol,
+            #symbol=symbol,
             width=width,
             marker_size=marker_size,
             edge_color=edge_color,
