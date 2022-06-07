@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import List
 
@@ -65,6 +66,68 @@ COLORMAP = np.array([colorsys.hsv_to_rgb(f, 1.0, 1) for f in np.linspace(0,1,COL
 
 executor = ThreadPoolExecutor()
 
+def gather_futures(*futures):
+    """
+    Return a new future that completes when all the given futures complete.
+
+    The value of the returned future is the tuple containing the values of all
+    the given futures.
+
+    If any of the futures complete with an exception, the returned future also
+    completes with an exception (which is arbitrarily chosen among the given
+    futures' exceptions).
+
+    If the returned future is canceled, it has no effect on the given futures
+    themselves.
+    """
+
+    ret = Future()
+
+    # Immediately mark as running, because we may finish upon calling
+    # add_done_callback()
+    not_canceled = ret.set_running_or_notify_cancel()
+    assert not_canceled
+
+    # We need a reentrant lock because done_callback() may be called
+    # synchronously inside add_done_callback()
+    lock = threading.RLock() 
+
+    with lock:
+        unfinished = set(futures)
+        if len(unfinished) < len(futures):
+            raise ValueError("Futures must be distinct")
+
+        results = [None] * len(futures)
+        finished = [False]
+
+        for i, fut in enumerate(futures):
+            def done_callback(f):
+                finished_results = None
+                finished_exception = None
+                with lock:
+                    if finished[0]:
+                        return
+                    unfinished.remove(f)
+                    try:
+                        results[i] = f.result()
+                        if not unfinished:
+                            finished_results = tuple(results)
+                            finished[0] = True
+                    except Exception as e:
+                        finished_exception = e
+                        finished[0] = True
+                    need_to_set_result = finished[0]
+
+                if need_to_set_result:
+                    if finished_results:
+                        ret.set_result(finished_results)
+                    else:
+                        ret.set_exception(finished_exception)
+
+            fut.add_done_callback(done_callback)
+
+    return ret
+
 class ComputeTask:
     def __init__(self, photon_count, params, frame_number, series_viewer):
         self.frame_number = frame_number
@@ -81,7 +144,7 @@ class ComputeTask:
         self.phasor_face_color = None
         self.done = None
 
-    @ensure_main_thread
+    @ensure_main_thread # start and cancel must not happen on different threads
     def start(self):
         if not self.all_started(): # don't start more than once
             assert self.intensity is None
@@ -90,11 +153,11 @@ class ComputeTask:
             self.phasor = executor.submit(compute_phasor, self.photon_count, self.params)
             self.phasor_quadtree = executor.submit(compute_phasor_quadtree, self.phasor)
             self.phasor_image = executor.submit(compute_phasor_image, self.phasor)
-            self.phasor_face_color = executor.submit(compute_phasor_face_color, self.intensity)
-            self.done = executor.submit(self.all_done())
+            self.phasor_face_color = executor.submit(set_phasor_face_color, self.intensity, self.series_viewer)
+            self.done = gather_futures(self.intensity, self.lifetime_image, self.phasor, self.phasor_quadtree, self.phasor_image, self.phasor_face_color)
             self.done.add_done_callback(self.series_viewer.update_selections_callback)
 
-    @ensure_main_thread
+    @ensure_main_thread # start and cancel must not happen on different threads
     def cancel(self):
         if self.all_started(): # if looking at an old snapshot
             self.intensity.cancel()
@@ -107,17 +170,6 @@ class ComputeTask:
     
     def all_started(self):
         return self.done is not None
-    
-    def all_done(self):
-        self.intensity.result()
-        self.lifetime_image.result()
-        self.phasor.result()
-        self.phasor_quadtree.result()
-        self.phasor_image.result()
-        self.phasor_face_color.result()
-        print("#########ALLDONE##############")
-        return True
-
 
 class FutureArray:
     """
@@ -313,8 +365,9 @@ class SeriesViewer():
         except OverflowError:
             print("##########WHYOVERFLOWS?###########")
         self.phasor_image.selected_data = {}
-        self.phasor_image.face_color = compute_phasor_face_color(tasks.intensity) # fast enough for ui thread?
-        #self.phasor_image.face_color = FutureArray(task_list[step].phasor_face_color, (self.get_num_phasors(),) + (4,))
+        #cannot use future array since napari checks for ndarray type >_<
+        #self.phasor_image.face_color = FutureArray(tasks.phasor_face_color, (self.get_num_phasors(),) + (4,))
+        #set_phasor_face_color(tasks.intensity, self)
         self.phasor_image.editable = False # need this?
 
     def get_tasks(self):
@@ -524,7 +577,7 @@ class SeriesViewer():
         self.options_widget.is_snapshot_frames.value = params.is_snapshot_frames
 
 
-# about 0.004 seconds for 256x256x256 data
+# about 0.1 seconds for 256x256x256 data
 @timing
 def compute_lifetime_image(photon_count, intensity_future : Future, params : UserParameters):
     period = params.period
@@ -564,6 +617,10 @@ def compute_phasor_face_color(intensity : Future):
     color = np.broadcast_to(1.0, phasor_intensity.shape)
     return np.asarray([color,color,color,phasor_intensity]).T
 
+def set_phasor_face_color(intensity : Future, series_viewer : SeriesViewer):
+    series_viewer.phasor_image.face_color = compute_phasor_face_color(intensity)
+
+@timing
 def compute_phasor(photon_count, params : UserParameters):
     period = params.period
     fit_start = params.fit_start
@@ -643,7 +700,7 @@ class LifetimeSelectionMetadata():
     def update_co_selection(self):
         step = self.series_viewer.get_current_step()
         tasks = self.series_viewer.snapshots[step].tasks
-        if tasks.done.running():
+        if tasks.done.running(): # need the results of some futures (timeout=0)
             return
         points = get_bounded_points(self.selection, self.series_viewer.get_image_shape())
         # is it possible that the current step changes during this update computation?
