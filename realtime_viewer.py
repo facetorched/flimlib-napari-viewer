@@ -1,5 +1,6 @@
 import colorsys
 import copy
+from ctypes import Union
 import dataclasses
 import json
 import logging
@@ -696,8 +697,16 @@ class LifetimeSelectionMetadata():
         self.co_selection = co_selection
         self.decay_plot = decay_plot
         self.series_viewer = series_viewer
-        
+    
+    def set_no_data(self):
+        empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
+        self.update_decay_plot(empty_histogram)
+        set_points(self.co_selection, None)
+
     def update_co_selection(self):
+        if len(self.selection.data) == 0:
+            self.set_no_data()
+            return
         step = self.series_viewer.get_current_step()
         tasks = self.series_viewer.snapshots[step].tasks
         if tasks.done.running(): # need the results of some futures (timeout=0)
@@ -708,12 +717,10 @@ class LifetimeSelectionMetadata():
         if(len(points) > 0):
             points_indexer = tuple(np.asarray(points).T)
             set_points(self.co_selection, tasks.phasor.result(timeout=0)[points_indexer])
-            histogram = np.mean(self.series_viewer.get_photon_count(0)[points_indexer],axis=0)
+            histogram = np.mean(self.series_viewer.get_photon_count(step)[points_indexer],axis=0)
             self.update_decay_plot(histogram)
         else:
-            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
-            self.update_decay_plot(empty_histogram)
-            set_points(self.co_selection, None)
+            self.set_no_data()
         self.co_selection.editable = False
 
     def update_decay_plot(self, selection):
@@ -727,17 +734,21 @@ class PhasorSelectionMetadata():
         self.decay_plot = decay_plot
         self.series_viewer = series_viewer
 
+    def set_no_data(self):
+        empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
+        self.update_decay_plot(empty_histogram)
+        set_points(self.co_selection, None)
+
     def update_co_selection(self):
+        if len(self.selection.data) == 0:
+            self.set_no_data()
+            return
         step = self.series_viewer.get_current_step()
         tasks = self.series_viewer.snapshots[step].tasks
         if tasks.done.running():
             return
-        if len(self.selection.data) == 0:
-            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
-            self.update_decay_plot(empty_histogram)
-            set_points(self.co_selection, None)
-            return
-        extrema = np.ceil(self.selection._extent_data).astype(int) # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
+        # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
+        extrema = np.ceil(self.selection._extent_data).astype(int) # the private field since `extent` is a `cached_property`
         bounding_center = np.mean(extrema, axis=0)
         bounding_shape = extrema[1] - extrema[0] + np.ones(2, dtype=int) # add one since extremas are inclusive. does this make sense?
         bounding_radius = np.max(bounding_center - extrema[0]) # distance in the p = inf norm
@@ -752,15 +763,15 @@ class PhasorSelectionMetadata():
             points = []
             offset=extrema[0]
             # use of private field `_data_view` since the shapes.py `to_masks()` fails to recognize offset
-            mask = self.selection._data_view.to_masks(mask_shape=bounding_shape, offset=offset).astype(bool)[0]
-
+            masks = self.selection._data_view.to_masks(mask_shape=bounding_shape, offset=offset)
+            union_mask = np.logical_or.reduce(masks)
             for point in bounded_points:
                 bounded_phasor = tasks.phasor.result(timeout=0)[tuple(point)]
                 mask_indexer = tuple(bounded_phasor - offset)
                 # kd tree found a square bounding box. some of these points might be outside of the rectangular mask
                 if mask_indexer[0] < 0 or mask_indexer[1] < 0 or mask_indexer[0] >= bounding_shape[0] or mask_indexer[1] >= bounding_shape[1]:
                     continue
-                if mask[mask_indexer]:
+                if union_mask[mask_indexer]:
                     points += [point]
             if points:
                 points = np.asarray(points)
@@ -768,12 +779,10 @@ class PhasorSelectionMetadata():
                     raise ValueError("Negative index encountered while indexing image layer. This is outside the image!")
                 set_points(self.co_selection, points)
                 points_indexer = tuple(points.T)
-                histogram = np.mean(self.series_viewer.get_photon_count()[points_indexer], axis=0)
+                histogram = np.mean(self.series_viewer.get_photon_count(step)[points_indexer], axis=0)
                 self.update_decay_plot(histogram)
         else:
-            empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
-            self.update_decay_plot(empty_histogram)
-            set_points(self.co_selection, None)
+            self.set_no_data()
         self.co_selection.editable = False
         
 
@@ -781,23 +790,21 @@ class PhasorSelectionMetadata():
         self.decay_plot.update_with_selection(selection, self.series_viewer.params)
 
 def get_points(layer: Shapes):
-        return get_bounded_points(layer, None)
+    return get_bounded_points(layer, None)
 
 def get_bounded_points(layer: Shapes, image_shape):
-        return np.asarray(np.where(layer.to_masks(image_shape).astype(bool)[0])).T
+    masks = layer.to_masks(image_shape).astype(bool)
+    if len(masks) == 0:
+        raise ValueError("can't find selection from empty shapes layer!")
+    union_mask = np.logical_or.reduce(masks)
+    return np.asarray(np.where(union_mask)).T
 
-def set_points(points_layer, points, intensity=None):
+def set_points(points_layer, points):
     try:
         points_layer.data = points if points is None or len(points) else None
     except OverflowError:
         # there seems to be a bug in napari with an overflow error
         pass
-    #except ValueError:
-    #    print(points.shape)
-    #    print(points_layer.data.shape)
-    if intensity is not None:
-        color = np.broadcast_to(1.0, (points.shape[0],))
-        points_layer.face_color = np.asarray([color,color,color,intensity]).T
     points_layer.selected_data = {}
 
 def select_shape_drag(layer, event):
@@ -814,8 +821,13 @@ def handle_new_shape(event):
     # changing the data triggers this event which may cause infinite recursion
     #if event_layer.data.shape[0] > 0 and event_layer.data.dtype != int:
     #    event_layer.data = np.round(event_layer.data).astype(int)
+    """
+    # delete all shapes except for the new shape
     if len(event_layer.data) > 1 and event_layer.editable:
-        event_layer.data = event_layer.data[-1:]
+        event_layer.selected_data = range(0, len(event_layer.data) - 1)
+        event_layer.remove_selected()
+        event_layer.seleted_data = [0]
+    """
     if len(event_layer.data) > 0:
         if('selection' in event_layer.metadata):
             event_layer.metadata['selection'].update_co_selection()
