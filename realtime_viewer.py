@@ -130,12 +130,10 @@ def gather_futures(*futures):
     return ret
 
 class ComputeTask:
-    def __init__(self, photon_count, params, frame_number, series_viewer):
-        self.frame_number = frame_number
-        self.photon_count = photon_count
-        self.params = params
-        self.series_viewer = series_viewer
-        self.started = False
+    def __init__(self, step, series_viewer):
+        self.valid = True
+        self.step = step
+        self.series_viewer = series_viewer # need this to retrieve the most recent
 
         self.intensity = None
         self.lifetime_image = None
@@ -148,15 +146,17 @@ class ComputeTask:
     @ensure_main_thread # start and cancel must not happen on different threads
     def start(self):
         if not self.all_started(): # don't start more than once
-            assert self.intensity is None
-            self.intensity = executor.submit(compute_intensity, self.photon_count)
-            self.lifetime_image = executor.submit(compute_lifetime_image, self.photon_count, self.intensity, self.params)
-            self.phasor = executor.submit(compute_phasor, self.photon_count, self.params)
+            photon_count = self.series_viewer.get_photon_count(self.step)
+            params = copy.deepcopy(self.series_viewer.params)
+
+            self.intensity = executor.submit(compute_intensity, photon_count)
+            self.lifetime_image = executor.submit(compute_lifetime_image, photon_count, self.intensity, params)
+            self.phasor = executor.submit(compute_phasor, photon_count, params)
             self.phasor_quadtree = executor.submit(compute_phasor_quadtree, self.phasor)
             self.phasor_image = executor.submit(compute_phasor_image, self.phasor)
-            self.phasor_face_color = executor.submit(set_phasor_face_color, self.intensity, self.series_viewer)
-            self.done = gather_futures(self.intensity, self.lifetime_image, self.phasor, self.phasor_quadtree, self.phasor_image, self.phasor_face_color)
-            self.done.add_done_callback(self.series_viewer.update_selections_callback)
+            self.phasor_face_color = executor.submit(compute_phasor_face_color, self.intensity)
+            self.done = gather_futures(self.intensity, self.lifetime_image, self.phasor, self.phasor_quadtree, self.phasor_image)
+            self.done.add_done_callback(self.series_viewer.update_displays_callback)
 
     @ensure_main_thread # start and cancel must not happen on different threads
     def cancel(self):
@@ -171,6 +171,12 @@ class ComputeTask:
     
     def all_started(self):
         return self.done is not None
+
+    def is_running(self):
+        return self.all_started() and self.done.running()
+
+    def all_done(self):
+        return self.all_started() and self.done.done()
 
 class FutureArray:
     """
@@ -208,13 +214,18 @@ class LifetimeImageProxy:
     An array-like object backed by the collection of lifetime_image tasks
     """
 
-    def __init__(self, task_list : List[ComputeTask], task_shape, dtype=np.float32):
-        if not len(task_list):
+    def __init__(self, tasks_list : List[ComputeTask], image_shape, dtype=np.float32):
+        if not len(tasks_list):
             raise ValueError # At least for now, don't allow empty
 
-        self._arrays = task_list
+        self._arrays = tasks_list
         self._dtype = dtype
-        self._task_shape = task_shape
+        self._task_shape = image_shape
+        #self._zeros = np.zeros(image_shape)
+        self._most_recent = np.zeros(image_shape)
+
+    def set_tasks_list(self, tasks_list : List[ComputeTask]):
+        self._arrays = tasks_list
 
     @property
     def ndim(self):
@@ -240,15 +251,21 @@ class LifetimeImageProxy:
             ret = np.empty(shape, dtype=self._dtype)
             j0 = 0
             for i0 in range(start, stop, step):
-                task = self._arrays[i0]
-                task.start()
-                ret[j0] = task.lifetime_image.result()[ndslices]
+                ret[j0] = self._get_slices_at_index(i0, ndslices)
                 j0 += 1
             return ret
         else:  # s0 is an integer
-            task = self._arrays[s0]
+            return self._get_slices_at_index(s0, ndslices)
+
+    def _get_slices_at_index(self, index, slices):
+        task = self._arrays[index]
+        if task.all_done():
+            print("Displaying done data!!!!!!!!!!")
+            self._most_recent = task.lifetime_image.result(timeout=0)
+        else:
+            print("#############starting tasks####################")
             task.start()
-            return task.lifetime_image.result()[ndslices]
+        return self._most_recent[slices]
 
     def __array__(self):
         print("################## NAPARI IS REQUESTING THE FULL ARRAY #####################")
@@ -293,7 +310,7 @@ class SeriesViewer():
 
         @self.lifetime_viewer.dims.events.current_step.connect
         def lifetime_slider_changed(event):
-            self.swap_phasor_proxy()
+            self.update_displays()
             self.update_selections()
         
         self.phasor_viewer = napari.Viewer(title="Phasor Viewer") #number this if there's more than one viewer?
@@ -319,7 +336,7 @@ class SeriesViewer():
         #create dummy image layers
         self.phasor_image = self.phasor_viewer.add_points(EMPTY_PHASOR_IMAGE, name="Phasor", edge_width=0, size=3)
         self.phasor_image.editable = False
-        self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
+        #self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
 
         #set up select layers
         create_lifetime_select_layer(self.lifetime_viewer, self.phasor_viewer, self, color=next(self.colors))
@@ -331,59 +348,47 @@ class SeriesViewer():
         self.reset_current_step()
 
     @ensure_main_thread
-    def process_live_data_callback(self, done):
-        self.process_live_data()
+    def update_displays_callback(self, done):
+        self.update_displays()
 
-    def process_live_data(self):
-        if not self.is_live_updated():
-            tasks_to_cancel = self.snapshots[-1].tasks
-            self.snapshots[-1].tasks = ComputeTask(self.get_photon_count(-1), copy.deepcopy(self.params), self.frame_number, self)
-            self.swap_proxy_arrays()
-            if tasks_to_cancel is not None: # first frame has no previous tasks
-                tasks_to_cancel.cancel()
-        else:
-            print("already???????????????????????")
+    def update_displays(self):
+        if 0 not in self.lifetime_viewer.dims.displayed:
+            step = self.get_current_step()
+            tasks = self.snapshots[step].tasks
+            if tasks.all_done():
+                try:
+                    self.phasor_image.data = tasks.phasor_image.result(timeout=0)
+                except OverflowError:
+                    print("why overflow")
+                self.phasor_image.face_color = tasks.phasor_face_color.result(timeout=0)
+                self.phasor_image.selected_data = {}
 
-    def process_all_snapshots(self):
-        params_copy = copy.deepcopy(self.params)
-        for i in range(len(self.snapshots) - 1):
-            tasks_to_cancel = self.snapshots[i].tasks
-            self.snapshots[i].tasks = ComputeTask(self.get_photon_count(i), params_copy, self.frame_number, self)
-            tasks_to_cancel.cancel()
-        self.process_live_data()
+        for i in range(len(self.snapshots)):
+            self.validate_tasks(i)
+        self.swap_lifetime_proxy_array()
+        
+    def validate_tasks(self, index):
+        tasks = self.snapshots[index].tasks
+        if tasks is None:
+            self.snapshots[index].tasks = ComputeTask(index, self)
+        elif not tasks.valid and not tasks.is_running():
+            self.snapshots[index].tasks = ComputeTask(index, self)
+            tasks.cancel()
 
-    def swap_proxy_arrays(self):
-        task_list = self.get_tasks()
-        self.lifetime_image.data = LifetimeImageProxy(task_list, self.get_image_shape() + (3,))
-        self.swap_phasor_proxy()
+    def swap_lifetime_proxy_array(self):
+        task_list = self.get_tasks_list()
+        if self.lifetime_image is not None:
+            self.lifetime_image.data.set_tasks_list(task_list)
+            self.lifetime_image.data = self.lifetime_image.data
 
-    def swap_phasor_proxy(self):
-        step = self.get_current_step()
-        tasks = self.snapshots[step].tasks
-        tasks.start()
-        try:
-            self.phasor_image.data = FutureArray(tasks.phasor_image, (self.get_num_phasors(),) + (2,), dtype=int)
-        except OverflowError:
-            print("##########WHYOVERFLOWS?###########")
-        self.phasor_image.selected_data = {}
-        #cannot use future array since napari checks for ndarray type >_<
-        #self.phasor_image.face_color = FutureArray(tasks.phasor_face_color, (self.get_num_phasors(),) + (4,))
-        #set_phasor_face_color(tasks.intensity, self)
-        self.phasor_image.editable = False # need this?
-
-    def get_tasks(self):
+    def get_tasks_list(self):
         return [snapshot.tasks for snapshot in self.snapshots]
-
-    def is_live_updated(self):
-        tasks = self.snapshots[-1].tasks
-        return tasks is not None and tasks.frame_number == self.frame_number
 
     def get_current_step(self):
         return self.lifetime_viewer.dims.current_step[0]
 
     def reset_current_step(self):
         self.lifetime_viewer.dims.set_current_step(0,0)
-        self.phasor_viewer.dims.set_current_step(0,0)
     
     def get_tau_axis_size(self):
         return self.snapshots[0].photon_count.shape[-1]
@@ -416,32 +421,31 @@ class SeriesViewer():
         self.setup_options_widget()
         self.update_options_widget(params_copy)
         autoscale_viewer(self.lifetime_viewer, self.get_image_shape())
+        task_list = self.get_tasks_list()
+        #self.lifetime_image.data = LifetimeImageProxy(task_list, self.get_image_shape() + (3,))
+        self.lifetime_image = self.lifetime_viewer.add_image(LifetimeImageProxy(task_list, self.get_image_shape() + (3,)), rgb=True, name="Lifetime")
+
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
-        self.frame_number = self.frame_number + 1
         # for now, we ignore all but the first channel
         photon_count = photon_count[tuple([0] * (photon_count.ndim - 3))]
         # check if this is the first time receiving data
         if not self.has_data():
             self.snapshots += [SnapshotData(photon_count, None)]
             self.setup()
-            self.process_live_data()
         else:
             self.snapshots[-1].photon_count = photon_count # live frame is the last
-            tasks = self.snapshots[-1].tasks
-            if tasks.all_started():
-                tasks.done.add_done_callback(self.process_live_data_callback)
-            else:
-                # if we are not on the live layer
-                self.process_live_data()
+            self.snapshots[-1].tasks.valid = False
+        
+        self.validate_tasks(-1)
+        self.swap_lifetime_proxy_array()
 
     def get_photon_count(self, step):
         if self.params.is_snapshot_frames and step != 0:
-            photon_count = self.snapshots[step].photon_count - self.snapshots[step - 1].photon_count
+            return self.snapshots[step].photon_count - self.snapshots[step - 1].photon_count
         else:
-            photon_count = self.snapshots[step].photon_count
-        return photon_count
+            return self.snapshots[step].photon_count
 
     @ensure_main_thread
     def update_selections_callback(self, done):
@@ -478,7 +482,8 @@ class SeriesViewer():
         def snap():
             if self.has_data():
                 prev = self.snapshots[-1]
-                self.snapshots += [SnapshotData(prev.photon_count, ComputeTask(prev.photon_count, copy.deepcopy(self.params), self.frame_number, self))]
+                index = len(self.snapshots)
+                self.snapshots += [SnapshotData(prev.photon_count, ComputeTask(index, self))]
         self.lifetime_viewer.window.add_dock_widget(snap, name='snapshot', area='left')
 
     def create_options_widget(self):
@@ -507,8 +512,13 @@ class SeriesViewer():
             self.params.max_chisq = max_chisq
             self.params.max_tau = max_tau
             self.params.is_snapshot_frames = is_snapshot_frames
-            if self.has_data:
-                self.process_all_snapshots()
+            if self.has_data():
+                for i in range(len(self.snapshots)):
+                    tasks = self.snapshots[i].tasks
+                    if tasks is not None:
+                        tasks.valid = False
+                    self.validate_tasks(i)
+                self.swap_lifetime_proxy_array()
         
         self.lifetime_viewer.window.add_dock_widget(options_widget, name ='parameters', area='right')
         self.options_widget = options_widget
@@ -618,8 +628,14 @@ def compute_phasor_face_color(intensity : Future):
     color = np.broadcast_to(1.0, phasor_intensity.shape)
     return np.asarray([color,color,color,phasor_intensity]).T
 
+@ensure_main_thread
 def set_phasor_face_color(intensity : Future, series_viewer : SeriesViewer):
-    series_viewer.phasor_image.face_color = compute_phasor_face_color(intensity)
+    it = intensity.result() # luckily this should compute fast so we won't hold up the UI thread
+    it = it / it.max()
+    phasor_intensity = it.ravel() * PHASOR_OPACITY_FACTOR
+    color = np.broadcast_to(1.0, phasor_intensity.shape)
+    face_color = np.asarray([color,color,color,phasor_intensity]).T
+    series_viewer.phasor_image.face_color = face_color
 
 @timing
 def compute_phasor(photon_count, params : UserParameters):
@@ -669,6 +685,7 @@ class CurveFittingPlot():
         self.rld_info = Text(None, parent=self.ax.view, color='r', anchor_x='right', font_size = FONT_SIZE)
         self.lm_info = Text(None, parent=self.ax.view, color='g', anchor_x='right', font_size = FONT_SIZE)
     
+    @timing
     def update_with_selection(self, selection, params : UserParameters):
         rld_selected, lm_selected = compute_fits(selection, params)
         period = params.period
@@ -703,15 +720,31 @@ class LifetimeSelectionMetadata():
         self.update_decay_plot(empty_histogram)
         set_points(self.co_selection, None)
 
+    @timing
     def update_co_selection(self):
         if len(self.selection.data) == 0:
             self.set_no_data()
             return
+        if not self.series_viewer.has_data():
+            return
         step = self.series_viewer.get_current_step()
         tasks = self.series_viewer.snapshots[step].tasks
-        if tasks.done.running(): # need the results of some futures (timeout=0)
+        # TODO I should just input the futures
+        if not tasks.all_done(): # need the results of some futures (timeout=0)
             return
-        points = get_bounded_points(self.selection, self.series_viewer.get_image_shape())
+
+        # by keeping this in the UI thread we avoid having to make a deep copy of the shapes layer
+        masks = self.get_masks()
+        # use of a update_number to make sure duplicate tasks aren't created
+        # need to use a task object for this reason. we can't have another compute task running a tthe same time.
+        # we want to be able to attach a callback to the all done
+        # and that callback checks to see if the update_number on the current task matches the global one
+        # and if not it will schedule a new task
+        # update number increments each time update_co_selections is called
+        # for the callback see process_live. Since this might be being called on something periodic, it is necessary
+        #executor.submit(compute_lifetime_co_selection)
+
+        points = get_bounded_points(masks)
         # is it possible that the current step changes during this update computation?
         
         if(len(points) > 0):
@@ -725,6 +758,13 @@ class LifetimeSelectionMetadata():
 
     def update_decay_plot(self, selection):
         self.decay_plot.update_with_selection(selection, self.series_viewer.params)
+
+    @timing
+    def get_masks(self):
+        return self.selection.to_masks(self.series_viewer.get_image_shape()).astype(bool)
+
+def compute_lifetime_co_selection(masks, image_shape):
+    points = get_bounded_points(masks, image_shape)
 
 # copied code from above with different coselection updating
 class PhasorSelectionMetadata():
@@ -743,9 +783,11 @@ class PhasorSelectionMetadata():
         if len(self.selection.data) == 0:
             self.set_no_data()
             return
+        if not self.series_viewer.has_data():
+            return
         step = self.series_viewer.get_current_step()
         tasks = self.series_viewer.snapshots[step].tasks
-        if tasks.done.running():
+        if not tasks.all_done(): # need the results of some futures (timeout=0)
             return
         # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
         extrema = np.ceil(self.selection._extent_data).astype(int) # the private field since `extent` is a `cached_property`
@@ -789,11 +831,11 @@ class PhasorSelectionMetadata():
     def update_decay_plot(self, selection):
         self.decay_plot.update_with_selection(selection, self.series_viewer.params)
 
-def get_points(layer: Shapes):
-    return get_bounded_points(layer, None)
+#def get_points(layer: Shapes):
+#    return get_bounded_points(layer, None)
 
-def get_bounded_points(layer: Shapes, image_shape):
-    masks = layer.to_masks(image_shape).astype(bool)
+@timing
+def get_bounded_points(masks: np.ndarray):
     if len(masks) == 0:
         raise ValueError("can't find selection from empty shapes layer!")
     union_mask = np.logical_or.reduce(masks)
