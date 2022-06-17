@@ -17,6 +17,7 @@ import napari
 from napari.layers.shapes.shapes import Shapes
 from napari.layers.points.points import Points
 import numpy as np
+from pandas import Series
 from plot_widget import Fig
 
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,7 @@ from PyQt5.QtWidgets import QWidget
 
 from functools import wraps
 from time import time
+from abc import ABC, abstractmethod
 
 # copied from stackoverflow.com :)
 def timing(f):
@@ -131,9 +133,9 @@ def gather_futures(*futures):
 
 class ComputeTask:
     def __init__(self, step, series_viewer):
-        self.valid = True
-        self.step = step
-        self.series_viewer = series_viewer # need this to retrieve the most recent
+        self._valid = True
+        self._step = step
+        self._series_viewer = series_viewer # need this to retrieve the most recent
 
         self.intensity = None
         self.lifetime_image = None
@@ -146,8 +148,8 @@ class ComputeTask:
     @ensure_main_thread # start and cancel must not happen on different threads
     def start(self):
         if not self.all_started(): # don't start more than once
-            photon_count = self.series_viewer.get_photon_count(self.step)
-            params = copy.deepcopy(self.series_viewer.params)
+            photon_count = self._series_viewer.get_photon_count(self._step)
+            params = copy.deepcopy(self._series_viewer.params)
 
             self.intensity = executor.submit(compute_intensity, photon_count)
             self.lifetime_image = executor.submit(compute_lifetime_image, photon_count, self.intensity, params)
@@ -156,7 +158,7 @@ class ComputeTask:
             self.phasor_image = executor.submit(compute_phasor_image, self.phasor)
             self.phasor_face_color = executor.submit(compute_phasor_face_color, self.intensity)
             self.done = gather_futures(self.intensity, self.lifetime_image, self.phasor, self.phasor_quadtree, self.phasor_image)
-            self.done.add_done_callback(self.series_viewer.update_displays_callback)
+            self.done.add_done_callback(self._series_viewer.update_displays_callback)
 
     @ensure_main_thread # start and cancel must not happen on different threads
     def cancel(self):
@@ -177,6 +179,13 @@ class ComputeTask:
 
     def all_done(self):
         return self.all_started() and self.done.done()
+
+    def invalidate(self):
+        if self.all_started():
+            self._valid = False
+
+    def is_valid(self):
+        return self._valid
 
 class FutureArray:
     """
@@ -371,13 +380,15 @@ class SeriesViewer():
         tasks = self.snapshots[index].tasks
         if tasks is None:
             self.snapshots[index].tasks = ComputeTask(index, self)
-        elif not tasks.valid and not tasks.is_running():
+        elif not tasks.is_valid() and not tasks.is_running():
             self.snapshots[index].tasks = ComputeTask(index, self)
             tasks.cancel()
 
     def swap_lifetime_proxy_array(self):
         task_list = self.get_tasks_list()
         if self.lifetime_image is not None:
+            # this is a little wierd. Maybe we should initialize a new proxy array each time
+            # the thing is, would need to pass the old one's _most_recent to the constructor of the new one
             self.lifetime_image.data.set_tasks_list(task_list)
             self.lifetime_image.data = self.lifetime_image.data
 
@@ -435,8 +446,9 @@ class SeriesViewer():
             self.snapshots += [SnapshotData(photon_count, None)]
             self.setup()
         else:
-            self.snapshots[-1].photon_count = photon_count # live frame is the last
-            self.snapshots[-1].tasks.valid = False
+            snap = self.snapshots[-1] # live frame is the last
+            snap.photon_count = photon_count
+            snap.tasks.invalidate()
         
         self.validate_tasks(-1)
         self.swap_lifetime_proxy_array()
@@ -456,10 +468,10 @@ class SeriesViewer():
     def update_selections(self):
         for layer in self.lifetime_viewer.layers:
             if 'selection' in layer.metadata:
-                layer.metadata['selection'].update_co_selection()
+                layer.metadata['selection'].update()
         for layer in self.phasor_viewer.layers:
             if 'selection' in layer.metadata:
-                layer.metadata['selection'].update_co_selection()
+                layer.metadata['selection'].update()
     
     def create_add_selection_widget(self):
         @magicgui(call_button="add lifetime selection")
@@ -516,7 +528,7 @@ class SeriesViewer():
                 for i in range(len(self.snapshots)):
                     tasks = self.snapshots[i].tasks
                     if tasks is not None:
-                        tasks.valid = False
+                        tasks.invalidate()
                     self.validate_tasks(i)
                 self.swap_lifetime_proxy_array()
         
@@ -655,9 +667,9 @@ def compute_fits(photon_count, params : UserParameters):
     period = params.period
     fit_start = params.fit_start
     fit_end = params.fit_end
-    rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end)
+    rld = flimlib.GCI_triple_integral_fitting_engine(period, photon_count, fit_start=fit_start, fit_end=fit_end, compute_residuals=False)
     param_in = [rld.Z, rld.A, rld.tau]
-    lm = flimlib.GCI_marquardt_fitting_engine(period, photon_count, param_in, fit_start=fit_start, fit_end=fit_end)
+    lm = flimlib.GCI_marquardt_fitting_engine(period, photon_count, param_in, fit_start=fit_start, fit_end=fit_end, compute_residuals=False, compute_covar=False, compute_alpha=False, compute_erraxes=False)
     return rld, lm
 
 def autoscale_viewer(viewer, shape):
@@ -686,16 +698,21 @@ class CurveFittingPlot():
         self.lm_info = Text(None, parent=self.ax.view, color='g', anchor_x='right', font_size = FONT_SIZE)
     
     @timing
-    def update_with_selection(self, selection, params : UserParameters):
-        rld_selected, lm_selected = compute_fits(selection, params)
+    def update_with_selection(self, selection_task : 'SelectionComputeTask'):
+        selection = selection_task.selection.result(timeout=0)
+        params = selection_task.params
+        
+        rld_selected = selection.rld
+        lm_selected = selection.lm
         period = params.period
         fit_start = params.fit_start
         fit_end = params.fit_end
+
         time = np.linspace(0, lm_selected.fitted.size * params.period, lm_selected.fitted.size, endpoint=False, dtype=np.float32)
         fit_time = time[fit_start:fit_end]
         self.lm_curve.set_data((fit_time, lm_selected.fitted[fit_start:fit_end]))
         self.rld_curve.set_data((fit_time, rld_selected.fitted[fit_start:fit_end]))
-        self.data_scatter.set_data(np.array((time, selection)).T, size=3, edge_width=0, face_color=self.scatter_color)
+        self.data_scatter.set_data(np.array((time, selection.histogram)).T, size=3, edge_width=0, face_color=self.scatter_color)
         self.rld_info.pos = self.ax.view.size[0], self.rld_info.font_size
         self.rld_info.text = 'RLD | chisq = ' + "{:.2e}".format(float(rld_selected.chisq)) + ', tau = ' + "{:.2e}".format(float(rld_selected.tau))
         self.lm_info.pos = self.ax.view.size[0], self.rld_info.font_size*3
@@ -708,138 +725,180 @@ class CurveFittingPlot():
         self.fit_start_line.set_data(([fit_start * period, fit_start * period], self.ax.camera._ylim))
         self.fit_end_line.set_data(([fit_end * period, fit_end * period], self.ax.camera._ylim))
 
-class LifetimeSelectionMetadata():
-    def __init__(self, selection : Shapes, co_selection : Points, decay_plot : CurveFittingPlot, series_viewer : SeriesViewer):
-        self.selection = selection
-        self.co_selection = co_selection
-        self.decay_plot = decay_plot
-        self.series_viewer = series_viewer
+@dataclass
+class SelectionResult:
+    histogram : np.ndarray
+    points : np.ndarray
+    rld : flimlib.TripleIntegralResult
+    lm : flimlib.MarquardtResult
+
+@dataclass
+class MaskResult:
+    extrema : np.ndarray
+    mask : np.ndarray
+
+class SelectionComputeTask:
+    @timing
+    def __init__(self, selection_metadata : 'SelectionMetadata'):
+        self._valid = True
+        self.done = None
+
+        series_viewer = selection_metadata.series_viewer
+        if not series_viewer.has_data():
+            self._valid = False
+            return
+        step = series_viewer.get_current_step()
+        photon_count = series_viewer.get_photon_count(step)
+        tasks = series_viewer.snapshots[step].tasks
+
+        self.params = copy.deepcopy(series_viewer.params)
+
+        mask_result = selection_metadata.compute_mask()
+
+        self.selection = executor.submit(selection_metadata.compute_selection, mask_result, tasks, photon_count, self.params)
+
+        self.done = gather_futures(self.selection)
+        self.done.add_done_callback(selection_metadata.update_callback)            
+
+    @ensure_main_thread
+    def cancel(self):
+        if self.all_started(): # if looking at an old snapshot
+            self.selection.cancel()
+            self.done.cancel()
     
-    def set_no_data(self):
-        empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
-        self.update_decay_plot(empty_histogram)
-        set_points(self.co_selection, None)
+    def all_started(self):
+        return self.done is not None
 
-    @timing
-    def update_co_selection(self):
-        if len(self.selection.data) == 0:
-            self.set_no_data()
-            return
-        if not self.series_viewer.has_data():
-            return
-        step = self.series_viewer.get_current_step()
-        tasks = self.series_viewer.snapshots[step].tasks
-        # TODO I should just input the futures
-        if not tasks.all_done(): # need the results of some futures (timeout=0)
-            return
+    def is_running(self):
+        return self.all_started() and self.done.running()
 
-        # by keeping this in the UI thread we avoid having to make a deep copy of the shapes layer
-        masks = self.get_masks()
-        # use of a update_number to make sure duplicate tasks aren't created
-        # need to use a task object for this reason. we can't have another compute task running a tthe same time.
-        # we want to be able to attach a callback to the all done
-        # and that callback checks to see if the update_number on the current task matches the global one
-        # and if not it will schedule a new task
-        # update number increments each time update_co_selections is called
-        # for the callback see process_live. Since this might be being called on something periodic, it is necessary
-        #executor.submit(compute_lifetime_co_selection)
+    def all_done(self):
+        return self.all_started() and self.done.done()
 
-        points = get_bounded_points(masks)
-        # is it possible that the current step changes during this update computation?
-        
-        if(len(points) > 0):
-            points_indexer = tuple(np.asarray(points).T)
-            set_points(self.co_selection, tasks.phasor.result(timeout=0)[points_indexer])
-            histogram = np.mean(self.series_viewer.get_photon_count(step)[points_indexer],axis=0)
-            self.update_decay_plot(histogram)
-        else:
-            self.set_no_data()
-        self.co_selection.editable = False
+    def invalidate(self):
+        if self.all_started():
+            self._valid = False
 
-    def update_decay_plot(self, selection):
-        self.decay_plot.update_with_selection(selection, self.series_viewer.params)
+    def is_valid(self):
+        return self._valid
 
-    @timing
-    def get_masks(self):
-        return self.selection.to_masks(self.series_viewer.get_image_shape()).astype(bool)
-
-def compute_lifetime_co_selection(masks, image_shape):
-    points = get_bounded_points(masks, image_shape)
-
-# copied code from above with different coselection updating
-class PhasorSelectionMetadata():
+class SelectionMetadata(ABC):
     def __init__(self, selection : Shapes, co_selection : Points, decay_plot : CurveFittingPlot, series_viewer : SeriesViewer):
         self.selection = selection
         self.co_selection = co_selection
         self.decay_plot = decay_plot
         self.series_viewer = series_viewer
+        self.tasks = SelectionComputeTask(self)
+    
+    @abstractmethod
+    def compute_selection(self, mask_result : MaskResult, tasks : SelectionComputeTask, photon_count : np.ndarray) -> SelectionResult:
+        pass
 
-    def set_no_data(self):
-        empty_histogram = np.zeros(self.series_viewer.get_tau_axis_size()) + np.nan
-        self.update_decay_plot(empty_histogram)
-        set_points(self.co_selection, None)
+    @abstractmethod
+    def compute_mask(self) -> MaskResult:
+        pass
 
-    def update_co_selection(self):
-        if len(self.selection.data) == 0:
-            self.set_no_data()
-            return
+    @ensure_main_thread
+    def update_callback(self, done):
+        self._update()
+
+    @timing
+    def _update(self):
         if not self.series_viewer.has_data():
             return
         step = self.series_viewer.get_current_step()
-        tasks = self.series_viewer.snapshots[step].tasks
-        if not tasks.all_done(): # need the results of some futures (timeout=0)
-            return
-        # verticies of bounding box [[x1, y1], [x2, y2]] where p1 < p2
-        extrema = np.ceil(self.selection._extent_data).astype(int) # the private field since `extent` is a `cached_property`
-        bounding_center = np.mean(extrema, axis=0)
-        bounding_shape = extrema[1] - extrema[0] + np.ones(2, dtype=int) # add one since extremas are inclusive. does this make sense?
-        bounding_radius = np.max(bounding_center - extrema[0]) # distance in the p = inf norm
-        height, width = self.series_viewer.get_image_shape()
-        maxpoints = width * height
-        distances, indices = tasks.phasor_quadtree.result(timeout=0).query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
-        n_indices = np.searchsorted(distances, np.inf)
-        if n_indices > 0:
-            indices = indices[0:n_indices]
-            bounded_points = np.asarray([indices // height, indices % width]).T
+        compute_tasks = self.series_viewer.snapshots[step].tasks
+        if compute_tasks.all_done(): # need the results of some futures (timeout=0)
+            if not self.tasks.is_valid() and not self.tasks.is_running():
+                self.tasks.cancel()
+                self.tasks = SelectionComputeTask(self)
+            if self.tasks.all_done():
+                self.decay_plot.update_with_selection(self.tasks)
+                # TODO why does the following line take more than 50% of the runtime of this function?
+                set_points(self.co_selection, self.tasks.selection.result(timeout=0).points)
+                self.co_selection.editable = False
+        
+    def update(self):
+        self.tasks.invalidate()
+        self._update()
 
-            points = []
+class LifetimeSelectionMetadata(SelectionMetadata):
+    @timing
+    def compute_mask(self):
+        if len(self.selection.data) == 0:
+            return None
+        else:
+            masks = self.selection.to_masks(self.series_viewer.get_image_shape()).astype(bool)
+            union_mask = np.logical_or.reduce(masks)
+            return MaskResult(mask=union_mask, extrema=None)
+
+    @timing
+    def compute_selection(self, mask_result: MaskResult, tasks: ComputeTask, photon_count: np.ndarray, params : UserParameters) -> SelectionResult:
+        if mask_result is not None:
+            points = np.asarray(np.where(mask_result.mask)).T
+            if(len(points) > 0):
+                points_indexer = tuple(np.asarray(points).T)
+                co_selection = tasks.phasor.result(timeout=0)[points_indexer]
+                histogram = np.mean(photon_count[points_indexer],axis=0)
+                rld, lm = compute_fits(histogram, params)
+                return SelectionResult(histogram=histogram, points=co_selection, rld=rld, lm=lm)
+        histogram = np.broadcast_to(np.array([np.nan]), (self.series_viewer.get_tau_axis_size(),))
+        co_selection = None
+        rld, lm = compute_fits(histogram, params) # TODO these are just gonna fail and return Nan results
+        return SelectionResult(histogram=histogram, points=co_selection, rld=rld, lm=lm)
+
+class PhasorSelectionMetadata(SelectionMetadata):
+    def compute_mask(self):
+        if len(self.selection.data) == 0:
+            return None
+        else:
+            extrema = np.ceil(self.selection._extent_data).astype(int) # the private field since `extent` is a `cached_property`
+            bounding_shape = extrema[1] - extrema[0] + 1 # add one since extremas are inclusive
             offset=extrema[0]
             # use of private field `_data_view` since the shapes.py `to_masks()` fails to recognize offset
             masks = self.selection._data_view.to_masks(mask_shape=bounding_shape, offset=offset)
             union_mask = np.logical_or.reduce(masks)
-            for point in bounded_points:
-                bounded_phasor = tasks.phasor.result(timeout=0)[tuple(point)]
-                mask_indexer = tuple(bounded_phasor - offset)
-                # kd tree found a square bounding box. some of these points might be outside of the rectangular mask
-                if mask_indexer[0] < 0 or mask_indexer[1] < 0 or mask_indexer[0] >= bounding_shape[0] or mask_indexer[1] >= bounding_shape[1]:
-                    continue
-                if union_mask[mask_indexer]:
-                    points += [point]
-            if points:
-                points = np.asarray(points)
-                if np.any(points < 0):
-                    raise ValueError("Negative index encountered while indexing image layer. This is outside the image!")
-                set_points(self.co_selection, points)
-                points_indexer = tuple(points.T)
-                histogram = np.mean(self.series_viewer.get_photon_count(step)[points_indexer], axis=0)
-                self.update_decay_plot(histogram)
-        else:
-            self.set_no_data()
-        self.co_selection.editable = False
-        
+            return MaskResult(extrema, union_mask)
 
-    def update_decay_plot(self, selection):
-        self.decay_plot.update_with_selection(selection, self.series_viewer.params)
+    def compute_selection(self, mask_result: MaskResult, tasks: ComputeTask, photon_count: np.ndarray, params : UserParameters) -> SelectionResult:
+        if mask_result is not None:
+            extrema = mask_result.extrema
+            mask = mask_result.mask
+            bounding_center = np.mean(extrema, axis=0)
+            bounding_shape = extrema[1] - extrema[0] + 1 # add one since extremas are inclusive
+            bounding_radius = np.max(bounding_center - extrema[0]) # distance in the p = inf norm
+            height, width = self.series_viewer.get_image_shape() # erm... I guess this is alright since this won't change
+            maxpoints = width * height
+            distances, indices = tasks.phasor_quadtree.result(timeout=0).query(bounding_center, maxpoints, p=np.inf, distance_upper_bound=bounding_radius)
+            n_indices = np.searchsorted(distances, np.inf)
+            if n_indices > 0:
+                indices = indices[0:n_indices]
+                bounded_points = np.asarray([indices // height, indices % width]).T
 
-#def get_points(layer: Shapes):
-#    return get_bounded_points(layer, None)
+                points = []
+                offset=extrema[0]
+                # use of private field `_data_view` since the shapes.py `to_masks()` fails to recognize offset
+                for point in bounded_points:
+                    bounded_phasor = tasks.phasor.result(timeout=0)[tuple(point)]
+                    mask_indexer = tuple(bounded_phasor - offset)
+                    # kd tree found a square bounding box. some of these points might be outside of the rectangular mask
+                    if mask_indexer[0] < 0 or mask_indexer[1] < 0 or mask_indexer[0] >= bounding_shape[0] or mask_indexer[1] >= bounding_shape[1]:
+                        continue
+                    if mask[mask_indexer]:
+                        points += [point]
+                if points:
+                    points = np.asarray(points)
+                    if np.any(points < 0):
+                        raise ValueError("Negative index encountered while indexing image layer. This is outside the image!")
+                    points_indexer = tuple(points.T)
+                    histogram = np.mean(photon_count[points_indexer], axis=0)
+                    rld, lm = compute_fits(histogram, params)
+                    return SelectionResult(histogram=histogram, points=points, rld=rld, lm=lm)
 
-@timing
-def get_bounded_points(masks: np.ndarray):
-    if len(masks) == 0:
-        raise ValueError("can't find selection from empty shapes layer!")
-    union_mask = np.logical_or.reduce(masks)
-    return np.asarray(np.where(union_mask)).T
+        histogram = np.broadcast_to(np.array([np.nan]), (self.series_viewer.get_tau_axis_size(),))
+        co_selection = None
+        rld, lm = compute_fits(histogram, params) # TODO these are just gonna fail and return Nan results
+        return SelectionResult(histogram=histogram, points=co_selection, rld=rld, lm=lm)
 
 def set_points(points_layer, points):
     try:
@@ -849,11 +908,11 @@ def set_points(points_layer, points):
         pass
     points_layer.selected_data = {}
 
-def select_shape_drag(layer, event):
-    layer.metadata['selection'].update_co_selection()
+def select_shape_drag(layer : Shapes, event):
+    layer.metadata['selection'].update()
     yield
     while event.type == 'mouse_move':
-        layer.metadata['selection'].update_co_selection()
+        layer.metadata['selection'].update()
         yield
 
 def handle_new_shape(event):
@@ -872,7 +931,7 @@ def handle_new_shape(event):
     """
     if len(event_layer.data) > 0:
         if('selection' in event_layer.metadata):
-            event_layer.metadata['selection'].update_co_selection()
+            event_layer.metadata['selection'].update()
 
 
 def create_lifetime_select_layer(viewer, co_viewer, series_viewer, color='#FF0000'):
