@@ -12,7 +12,6 @@ from typing import List
 
 import flimlib
 import h5py
-from matplotlib.cbook import flatten
 import napari
 from napari.layers.shapes.shapes import Shapes
 from napari.layers.points.points import Points
@@ -346,10 +345,6 @@ class SeriesViewer():
         self.phasor_image = self.phasor_viewer.add_points(EMPTY_PHASOR_IMAGE, name="Phasor", edge_width=0, size=3)
         self.phasor_image.editable = False
         #self.lifetime_image = self.lifetime_viewer.add_image(EMPTY_RGB_IMAGE, rgb=True, name="Lifetime")
-
-        #set up select layers
-        create_lifetime_select_layer(self.lifetime_viewer, self.phasor_viewer, self, color=next(self.colors))
-        #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
         
         self.create_add_selection_widget()
         self.create_options_widget()
@@ -436,6 +431,9 @@ class SeriesViewer():
         #self.lifetime_image.data = LifetimeImageProxy(task_list, self.get_image_shape() + (3,))
         self.lifetime_image = self.lifetime_viewer.add_image(LifetimeImageProxy(task_list, self.get_image_shape() + (3,)), rgb=True, name="Lifetime")
 
+        #set up select layers
+        create_lifetime_select_layer(self.lifetime_viewer, self.phasor_viewer, self, color=next(self.colors))
+        #create_phasor_select_layer(self.phasor_viewer, self.lifetime_viewer, self, color=next(self.colors))
 
     # called after new data arrives
     def receive_and_update(self, photon_count):
